@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="0">
+        
+        <!-- ========== MODULE CATEGORY ========== -->
+        <record id="module_category_return_approval" model="ir.module.category">
+            <field name="name">Return Approval</field>
+            <field name="description">Return Approval Management for Point of Sale</field>
+            <field name="parent_id" ref="base.module_category_sales_point_of_sale"/>
+            <field name="sequence">15</field>
+        </record>
+
+        <!-- ========== BASE GROUPS ========== -->
+        
+        <!-- Group: Return Approval User (BASE GROUP) -->
+        <record id="group_return_approval_user" model="res.groups">
+            <field name="name">Return Approval User</field>
+            <field name="implied_ids" eval="[(4, ref('base.group_user'))]"/>
+            <field name="category_id" ref="module_category_return_approval"/>
+            <field name="comment">Can create and view return approval requests</field>
+        </record>
+
+        <!-- ========== APPROVAL LEVEL GROUPS ========== -->
+        
+        <!-- Group: Approval Level 1 (Supervisor/Manager) -->
+        <record id="group_return_approval_level_1" model="res.groups">
+            <field name="name">Return Approval Level 1</field>
+            <field name="implied_ids" eval="[(4, ref('group_return_approval_user'))]"/>
+            <field name="category_id" ref="module_category_return_approval"/>
+            <field name="comment">Can approve/reject at Level 1 (Final approval if single-level, or second approval in multi-level)</field>
+        </record>
+
+        <!-- Group: Approval Level 2 (Manager/Director) -->
+        <record id="group_return_approval_level_2" model="res.groups">
+            <field name="name">Return Approval Level 2</field>
+            <field name="implied_ids" eval="[(4, ref('group_return_approval_level_1'))]"/>
+            <field name="category_id" ref="module_category_return_approval"/>
+            <field name="comment">Can approve/reject at Level 2 (First approval in multi-level workflow)</field>
+        </record>
+
+        <!-- ========== MANAGER GROUP ========== -->
+        
+        <!-- Group: Return Approval Manager -->
+        <record id="group_return_approval_manager" model="res.groups">
+            <field name="name">Return Approval Manager</field>
+            <field name="implied_ids" eval="[(4, ref('group_return_approval_level_2'))]"/>
+            <field name="category_id" ref="module_category_return_approval"/>
+            <field name="comment">Full access to return approval management including create, delete, and configuration</field>
+        </record>
+
+        <!-- ========== RECORD RULES ========== -->
+        
+        <!-- Return Approval Rules -->
+        
+        <!-- Rule: User - Own Records Only -->
+        <record id="return_approval_rule_user" model="ir.rule">
+            <field name="name">Return Approval: User - Own Records</field>
+            <field name="model_id" ref="model_return_approval"/>
+            <field name="domain_force">[('gm_requested_by', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <!-- Rule: Level 1 - All Records (Read/Write for Approval) -->
+        <record id="return_approval_rule_level_1" model="ir.rule">
+            <field name="name">Return Approval: Level 1 - All Records</field>
+            <field name="model_id" ref="model_return_approval"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_level_1'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <!-- Rule: Level 2 - All Records (Read/Write for Approval) -->
+        <record id="return_approval_rule_level_2" model="ir.rule">
+            <field name="name">Return Approval: Level 2 - All Records</field>
+            <field name="model_id" ref="model_return_approval"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_level_2'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <!-- Rule: Manager - Full Access -->
+        <record id="return_approval_rule_manager" model="ir.rule">
+            <field name="name">Return Approval: Manager - Full Access</field>
+            <field name="model_id" ref="model_return_approval"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_manager'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <!-- Return Approval Line Rules -->
+        
+        <!-- Rule: All Users - Access via Parent Record -->
+        <record id="return_approval_line_rule_all" model="ir.rule">
+            <field name="name">Return Approval Line: All Users</field>
+            <field name="model_id" ref="model_return_approval_line"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <!-- Return Approval History Rules -->
+        
+        <!-- Rule: All Users - Read Only -->
+        <record id="return_approval_history_rule_all" model="ir.rule">
+            <field name="name">Return Approval History: All Users - Read Only</field>
+            <field name="model_id" ref="model_return_approval_history"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="False"/>
+            <field name="perm_create" eval="False"/>
+            <field name="perm_unlink" eval="False"/>
+        </record>
+
+        <!-- Rule: Manager - Full Access to History -->
+        <record id="return_approval_history_rule_manager" model="ir.rule">
+            <field name="name">Return Approval History: Manager - Full Access</field>
+            <field name="model_id" ref="model_return_approval_history"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_manager'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <!-- Return Approval Wizard Rules -->
+        
+        <!-- Rule: All Approvers - Access Wizard -->
+        <record id="return_approval_wizard_rule_all" model="ir.rule">
+            <field name="name">Return Approval Wizard: All Users</field>
+            <field name="model_id" ref="model_return_approval_wizard"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_return_approval_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+    </data>
+</odoo>

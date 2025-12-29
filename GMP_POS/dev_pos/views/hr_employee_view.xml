@@ -1,0 +1,38 @@
+<odoo>
+  <data>
+
+    <record model="ir.ui.view" id="view_hr_employee_form">
+      <field name="name">hr.employee.form</field>
+      <field name="model">hr.employee</field>
+      <field name="inherit_id" ref="hr.view_employee_form"/>
+      <field name="arch" type="xml">
+        <xpath expr="//field[@name='coach_id']" position="after">
+            <field name="is_integrated"/>
+            <field name="vit_employee_code"/>
+            <field name="index_store" widget="many2many_tags"/>
+        </xpath>
+        <xpath expr="//page[@name='hr_settings']" position="after">
+            <page string="Access Right" name="access_right" groups="base.group_erp_manager">
+                <group>
+                    <group>
+                        <field name="is_sales_person"/>
+                        <field name="is_cashier"/>
+                        <field name="is_pic"/>
+                    </group>
+                </group>
+            </page>
+        </xpath>
+        <xpath expr="//field[@name='is_integrated']" position="attributes">
+          <attribute name="force_save">1</attribute>
+          <attribute name="readonly">True</attribute>
+        </xpath>
+        <xpath expr="//field[@name='index_store']" position="attributes">
+          <attribute name="force_save">1</attribute>
+          <attribute name="readonly">True</attribute>
+        </xpath>
+      </field>
+    </record>
+
+
+  </data>
+</odoo>

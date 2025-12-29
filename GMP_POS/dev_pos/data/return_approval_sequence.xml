@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="1">
+        
+        <!-- Sequence for Return Approval Document Number -->
+        <record id="sequence_return_approval" model="ir.sequence">
+            <field name="name">Return Approval Sequence</field>
+            <field name="code">return.approval</field>
+            <field name="prefix">RA/%(year)s/</field>
+            <field name="padding">4</field>
+            <field name="number_increment">1</field>
+            <field name="number_next">1</field>
+            <field name="implementation">standard</field>
+        </record>
+
+    </data>
+</odoo>

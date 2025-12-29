@@ -1,0 +1,6 @@
+python-barcode
+reportlab
+pillow
+matplotlib
+pytz
+python-dateutil

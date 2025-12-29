@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- ============================================ -->
+    <!-- APPROVAL WIZARD -->
+    <!-- ============================================ -->
+    
+    <record id="view_return_approval_wizard_form" model="ir.ui.view">
+        <field name="name">return.approval.wizard.form</field>
+        <field name="model">return.approval.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Approval Action">
+                <group>
+                    <field name="action" invisible="1"/>
+                    <field name="level" invisible="1"/>
+                    <field name="notes" placeholder="Add notes or comments (optional)..."/>
+                </group>
+                <footer>
+                    <button name="action_confirm" string="Confirm" type="object" class="oe_highlight"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_return_approval_wizard" model="ir.actions.act_window">
+        <field name="name">Approval Action</field>
+        <field name="res_model">return.approval.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
+</odoo>

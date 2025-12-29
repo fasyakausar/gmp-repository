@@ -1,0 +1,5 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_pos_cashier_log,access_pos.cashier.log,model_pos_cashier_log,base.group_user,1,1,1,1
+access_end_shift,access_end.shift,model_end_shift,base.group_user,1,1,1,1
+access_end_shift_line,access_end.shift.line,model_end_shift_line,base.group_user,1,1,1,1
+access_end_shift_notes_wizard,access_end.shift.notes.wizard,model_end_shift_notes_wizard,base.group_user,1,1,1,1

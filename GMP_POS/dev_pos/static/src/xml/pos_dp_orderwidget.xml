@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates id="template" xml:space="preserve">
+    
+    <!-- Add Gift Card Info to OrderWidget details slot -->
+    <t t-name="point_of_sale.ProductScreen" t-inherit="point_of_sale.ProductScreen" t-inherit-mode="extension">
+        <xpath expr="//OrderWidget/t[@t-set-slot='details']" position="inside">
+            
+            <!-- Gift Card Section -->
+            <t t-if="pos.get_order()">
+                <t t-set="giftCards" t-value="pos.get_order().getAppliedGiftCardsInfo()"/>
+                
+                <!-- Debug info (optional) -->
+                <div t-if="giftCards.length > 0" class="w-100 border-top fw-bolder d-flex flex-column px-3 py-2 bg-light">
+                    <div class="text-center text-muted small">
+                        🎁 Found <t t-esc="giftCards.length"/> gift card(s)
+                    </div>
+                </div>
+                
+                <!-- Display each gift card -->
+                <t t-foreach="giftCards" t-as="giftCard" t-key="giftCard_index">
+                    <div class="w-100 border-top fw-bolder d-flex flex-column px-3 py-2 bg-success bg-opacity-10">
+                        <div class="gift-card-title text-center mb-2 text-success">
+                            <i class="fa fa-gift me-2"></i>
+                            <span t-esc="giftCard.program_type === 'ewallet' ? 'eWallet' : 'Gift Card'"/> Applied
+                        </div>
+                        <div class="d-flex justify-content-around gap-2">
+                            <div class="d-flex flex-column align-items-center justify-content-center flex-grow-1 rounded bg-white px-3 py-2 border">
+                                <span class="text-muted small">Code</span>
+                                <span class="value fw-bold"><t t-esc="giftCard.code"/></span>
+                            </div>
+                            <div class="d-flex flex-column align-items-center justify-content-center flex-grow-1 rounded bg-white px-3 py-2 border">
+                                <span class="text-muted small">Amount</span>
+                                <span class="value text-danger fw-bold">
+                                    -<t t-esc="giftCard.display_amount"/>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </t>
+            </t>
+            
+        </xpath>
+    </t>
+    
+</templates>
