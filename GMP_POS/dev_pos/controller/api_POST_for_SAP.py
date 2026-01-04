@@ -2450,180 +2450,212 @@ class POSTGoodsIssue(http.Controller):
                 return {'status': "Failed", 'code': 401, 'message': "Authentication failed."}
 
             env = request.env
-            
             data = request.get_json_data()
             
-            # ✅ Get company_name from Body JSON
-            company_name = data.get('company_name')
-            picking_type_name = data.get('picking_type')
-            location_id = data.get('location_id')
-            location_dest_id = data.get('location_dest_id')
-            scheduled_date = data.get('scheduled_date')
-            date_done = data.get('date_done')
-            transaction_id = data.get('transaction_id')
-            move_type = data.get('move_type')
-            move_lines = data.get('move_lines', [])
-
-            # ✅ Validate company_name is required
-            if not company_name:
+            # ✅ Validasi input fields yang required
+            required_fields = ['company_name', 'picking_type', 'location_id', 'location_dest_id', 
+                             'scheduled_date', 'transaction_id', 'move_type', 'move_lines']
+            missing_fields = [f for f in required_fields if not data.get(f)]
+            
+            if missing_fields:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': "Field 'company_name' is required in request body."
+                    'message': f"Missing required fields: {', '.join(missing_fields)}"
                 }
 
-            # Validate and get company
+            company_name = data['company_name']
+            picking_type_name = data['picking_type']
+            location_id = data['location_id']
+            location_dest_id = data['location_dest_id']
+            scheduled_date = data['scheduled_date']
+            date_done = data.get('date_done')  # Optional
+            transaction_id = data['transaction_id']
+            move_type = data['move_type']
+            move_lines = data['move_lines']
+
+            # Validate company
             company = env['res.company'].sudo().search([('name', '=', company_name)], limit=1)
             if not company:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Company with name '{company_name}' not found."
+                    'message': f"Company '{company_name}' not found."
                 }
             
             company_id = company.id
-            company_name_display = company.name
 
-            # ✅ Set context dengan company yang benar
-            env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
+            # ❌ HAPUS context switching
+            # env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
 
-            # Validate if Goods Issue already exists
-            existing_goods_issue = env['stock.picking'].sudo().search([
+            # Check duplicate Goods Issue
+            existing_gi = env['stock.picking'].sudo().search([
                 ('vit_trxid', '=', transaction_id), 
                 ('picking_type_id.name', '=', 'Goods Issue'),
                 ('company_id', '=', company_id)
             ], limit=1)
             
-            if existing_goods_issue:    
+            if existing_gi:    
                 return {
-                    'code': 400,
+                    'code': 409,  # ✅ 409 Conflict untuk duplicate
                     'status': 'failed',
                     'message': 'Goods Issue already exists',
-                    'id': existing_goods_issue.id,
-                    'doc_num': existing_goods_issue.name,
-                    'company_name': existing_goods_issue.company_id.name
-                }         
+                    'data': {
+                        'id': existing_gi.id,
+                        'doc_num': existing_gi.name,
+                        'company_name': existing_gi.company_id.name
+                    }
+                }
 
-            # Validate picking type
+            # ✅ Validate picking type dengan company eksplisit
             picking_type = env['stock.picking.type'].sudo().search([
                 ('name', '=', picking_type_name),
                 ('company_id', '=', company_id)
             ], limit=1)
+            
             if not picking_type:
                 return {
                     'status': "Failed", 
                     'code': 400, 
-                    'message': f"Picking type '{picking_type_name}' not found for company '{company_name_display}'."
+                    'message': f"Picking type '{picking_type_name}' not found for company '{company.name}'."
                 }
 
-            # Validate locations
-            source_location = env['stock.location'].sudo().search([
-                ('id', '=', location_id),
-                '|',
-                ('company_id', '=', company_id),
-                ('company_id', '=', False)
-            ], limit=1)
+            # ✅ Validate locations - ambil dulu, lalu cek company-nya
+            source_location = env['stock.location'].sudo().browse(location_id)
+            dest_location = env['stock.location'].sudo().browse(location_dest_id)
             
-            dest_location = env['stock.location'].sudo().search([
-                ('id', '=', location_dest_id),
-                '|',
-                ('company_id', '=', company_id),
-                ('company_id', '=', False)
-            ], limit=1)
-            
-            if not source_location:
+            if not source_location.exists():
                 return {
                     'status': "Failed", 
                     'code': 400, 
-                    'message': f"Source location with ID {location_id} not found for company '{company_name_display}'."
+                    'message': f"Source location ID {location_id} not found."
                 }
             
-            if not dest_location:
+            if not dest_location.exists():
                 return {
                     'status': "Failed", 
                     'code': 400, 
-                    'message': f"Destination location with ID {location_dest_id} not found for company '{company_name_display}'."
+                    'message': f"Destination location ID {location_dest_id} not found."
                 }
-
-            # Validate all products first
-            missing_products = []
-            for line in move_lines:
-                product_code = line.get('product_code')
-                product_id = env['product.product'].sudo().search([
-                    ('default_code', '=', product_code),
-                    '|',
-                    ('company_id', '=', company_id),
-                    ('company_id', '=', False)
-                ], limit=1)
-                if not product_id:
-                    missing_products.append(product_code)
-
-            if missing_products:
+            
+            # ✅ Cek apakah location milik company yang diminta atau shared
+            if source_location.company_id and source_location.company_id.id != company_id:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Products with codes {', '.join(missing_products)} not found for company '{company_name_display}'. Goods Issue creation cancelled."
+                    'message': f"Source location belongs to '{source_location.company_id.name}', not '{company.name}'."
+                }
+            
+            if dest_location.company_id and dest_location.company_id.id != company_id:
+                return {
+                    'status': "Failed",
+                    'code': 400,
+                    'message': f"Destination location belongs to '{dest_location.company_id.name}', not '{company.name}'."
+                }
+
+            # ✅ Validate move_lines not empty
+            if not move_lines:
+                return {
+                    'status': "Failed",
+                    'code': 400,
+                    'message': "Move lines cannot be empty."
+                }
+
+            # ✅ Validate products dengan pengecekan company eksplisit
+            missing_products = []
+            invalid_products = []
+            invalid_quantities = []
+            
+            for idx, line in enumerate(move_lines):
+                product_code = line.get('product_code')
+                product_uom_qty = line.get('product_uom_qty')
+                
+                if not product_code:
+                    missing_products.append(f"Line {idx + 1}: missing product_code")
+                    continue
+                    
+                if product_uom_qty is None:
+                    invalid_quantities.append(f"{product_code}: missing quantity")
+                    continue
+                
+                try:
+                    qty = float(product_uom_qty)
+                    if qty <= 0:
+                        invalid_quantities.append(f"{product_code}: quantity must be positive")
+                except (ValueError, TypeError):
+                    invalid_quantities.append(f"{product_code}: invalid quantity format")
+                    continue
+                
+                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                
+                if not product_id:
+                    missing_products.append(product_code)
+                elif product_id.company_id and product_id.company_id.id != company_id:
+                    invalid_products.append(f"{product_code} (belongs to {product_id.company_id.name})")
+
+            # ✅ Consolidated error messages
+            errors = []
+            if missing_products:
+                errors.append(f"Products not found: {', '.join(missing_products)}")
+            if invalid_products:
+                errors.append(f"Products not in company: {', '.join(invalid_products)}")
+            if invalid_quantities:
+                errors.append(f"Invalid quantities: {', '.join(invalid_quantities)}")
+            
+            if errors:
+                return {
+                    'status': "Failed",
+                    'code': 400,
+                    'message': "; ".join(errors)
                 }
 
             # Create Goods Issue
-            goods_issue = env['stock.picking'].sudo().create({
+            gi_vals = {
                 'picking_type_id': picking_type.id,
-                'location_id': source_location.id,      # ✅ Gunakan .id dari object
-                'location_dest_id': dest_location.id,   # ✅ Gunakan .id dari object
+                'location_id': source_location.id,
+                'location_dest_id': dest_location.id,
                 'move_type': move_type,
                 'scheduled_date': scheduled_date,
-                'date_done': date_done,
                 'vit_trxid': transaction_id,
                 'company_id': company_id,
                 'create_uid': uid,
-            })
+            }
+            
+            if date_done:
+                gi_vals['date_done'] = date_done
+                
+            goods_issue = env['stock.picking'].sudo().create(gi_vals)
 
-            # Create move lines
-            move_line_vals = []
+            # ✅ Create move lines langsung
             for line in move_lines:
                 product_code = line.get('product_code')
-                product_uom_qty = line.get('product_uom_qty')
-                product_id = env['product.product'].sudo().search([
-                    ('default_code', '=', product_code),
-                    '|',
-                    ('company_id', '=', company_id),
-                    ('company_id', '=', False)
-                ], limit=1)
+                product_uom_qty = float(line.get('product_uom_qty'))
+                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
 
-                move_vals = {
+                env['stock.move'].sudo().create({
                     'name': product_id.name,
                     'product_id': product_id.id,
                     'product_uom': product_id.uom_id.id,
-                    'product_uom_qty': float(product_uom_qty),
-                    'quantity': float(product_uom_qty),
+                    'product_uom_qty': product_uom_qty,
                     'picking_id': goods_issue.id,
-                    'location_id': source_location.id,      # ✅ Gunakan .id dari object
-                    'location_dest_id': dest_location.id,   # ✅ Gunakan .id dari object
+                    'location_id': source_location.id,
+                    'location_dest_id': dest_location.id,
                     'company_id': company_id,
                     'state': 'draft',
-                }
-                move_line_vals.append((0, 0, move_vals))
+                })
 
-            # Update goods issue with move lines
-            goods_issue.write({
-                'move_ids_without_package': move_line_vals
-            })
-
-            try:
-                # Validate the goods issue
-                goods_issue.button_validate()
-            except Exception as validate_error:
-                env.cr.rollback()
-                goods_issue.sudo().unlink()
-                raise Exception(f"Failed to validate Goods Issue: {str(validate_error)}")
+            # Validate the goods issue
+            goods_issue.button_validate()
 
             return {
                 'code': 200,
                 'status': 'success',
                 'message': 'Goods Issue created and validated successfully',
-                'id': goods_issue.id,
-                'doc_num': goods_issue.name,
-                'company_name': goods_issue.company_id.name
+                'data': {
+                    'id': goods_issue.id,
+                    'doc_num': goods_issue.name,
+                    'company_name': goods_issue.company_id.name
+                }
             }
             
         except Exception as e:
@@ -2634,15 +2666,14 @@ class POSTGoodsIssue(http.Controller):
                 'code': 500, 
                 'message': f"Failed to create Goods Issue: {str(e)}"
             }
-        
+
+
 class POSTPurchaseOrderFromSAP(http.Controller):
     @http.route('/api/purchase_order', type='json', auth='none', methods=['POST'], csrf=False)
     def post_purchase_order(self, **kw):
         try:
-            # 🔐 Authentication
-            config = request.env['setting.config'].sudo().search(
-                [('vit_config_server', '=', 'mc')], limit=1
-            )
+            # Authentication
+            config = request.env['setting.config'].sudo().search([('vit_config_server', '=', 'mc')], limit=1)
             if not config:
                 return {'status': "Failed", 'code': 500, 'message': "Configuration not found."}
 
@@ -2655,90 +2686,95 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                 return {'status': "Failed", 'code': 401, 'message': "Authentication failed."}
 
             env = request.env
-
-            # 📥 Get JSON payload
             data = request.get_json_data()
             
-            # ✅ Get company_name from Body JSON
-            company_name = data.get('company_name')
-            customer_code = data.get('customer_code')
-            vendor_reference = data.get('vendor_reference')
-            currency_name = data.get('currency_id')
-            date_order = data.get('date_order')
-            transaction_id = data.get('transaction_id')
-            expected_arrival = data.get('expected_arrival')
-            picking_type_name = data.get('picking_type')
-            location_id = data.get('location_id')
-            order_line = data.get('order_line', [])
-
-            # ✅ Validate company_name is required
-            if not company_name:
+            # ✅ Validasi input fields yang required
+            required_fields = ['company_name', 'customer_code', 'vendor_reference', 'currency_id', 
+                             'date_order', 'transaction_id', 'expected_arrival', 'picking_type', 
+                             'location_id', 'order_line']
+            missing_fields = [f for f in required_fields if not data.get(f)]
+            
+            if missing_fields:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': "Field 'company_name' is required in request body."
+                    'message': f"Missing required fields: {', '.join(missing_fields)}"
                 }
 
-            # Validate and get company
+            company_name = data['company_name']
+            customer_code = data['customer_code']
+            vendor_reference = data['vendor_reference']
+            currency_name = data['currency_id']
+            date_order = data['date_order']
+            transaction_id = data['transaction_id']
+            expected_arrival = data['expected_arrival']
+            picking_type_name = data['picking_type']
+            location_id = data['location_id']
+            order_line = data['order_line']
+
+            # Validate company
             company = env['res.company'].sudo().search([('name', '=', company_name)], limit=1)
             if not company:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Company with name '{company_name}' not found."
+                    'message': f"Company '{company_name}' not found."
                 }
             
             company_id = company.id
-            company_name_display = company.name
 
-            # ✅ Set context dengan company yang benar
-            env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
+            # ❌ HAPUS context switching
+            # env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
 
-            # 🔎 Check duplicate PO
+            # Check duplicate PO
             existing_po = env['purchase.order'].sudo().search([
                 ('vit_trxid', '=', transaction_id),
-                ('picking_type_id.name', '=', picking_type_name),
-                ('picking_type_id.default_location_dest_id', '=', location_id),
                 ('company_id', '=', company_id)
             ], limit=1)
 
             if existing_po:
                 return {
-                    'code': 400,
+                    'code': 409,  # ✅ 409 Conflict untuk duplicate
                     'status': 'failed',
                     'message': 'Purchase Order already exists',
-                    'id': existing_po.id,
-                    'doc_num': existing_po.name,
-                    'company_name': existing_po.company_id.name
+                    'data': {
+                        'id': existing_po.id,
+                        'doc_num': existing_po.name,
+                        'company_name': existing_po.company_id.name
+                    }
                 }
 
-            # 🔎 Validate customer
-            customer = env['res.partner'].sudo().search([
-                ('customer_code', '=', customer_code),
-                '|',
-                ('company_id', '=', company_id),
-                ('company_id', '=', False)
-            ], limit=1)
+            # ✅ Validate customer (vendor) dengan pengecekan company eksplisit
+            customer = env['res.partner'].sudo().search([('customer_code', '=', customer_code)], limit=1)
             
             if not customer:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Customer with code '{customer_code}' not found for company '{company_name_display}'.",
+                    'message': f"Customer with code '{customer_code}' not found."
                 }
+            
+            # ✅ Cek apakah partner milik company atau shared
+            if customer.company_id and customer.company_id.id != company_id:
+                return {
+                    'status': "Failed",
+                    'code': 400,
+                    'message': f"Customer '{customer_code}' belongs to '{customer.company_id.name}', not '{company.name}'."
+                }
+            
             customer_id = customer.id
 
-            # 🔎 Validate currency
+            # Validate currency
             currency = env['res.currency'].sudo().search([('name', '=', currency_name)], limit=1)
             if not currency:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Currency with name '{currency_name}' not found.",
+                    'message': f"Currency '{currency_name}' not found."
                 }
             currency_id = currency.id
 
-            # 🔎 Validate picking type
+            # ✅ Validate picking type dengan company eksplisit
             picking_types = env['stock.picking.type'].sudo().search([
                 ('name', '=', picking_type_name),
                 ('default_location_dest_id', '=', location_id),
@@ -2749,69 +2785,120 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Picking type '{picking_type_name}' with location_id '{location_id}' not found for company '{company_name_display}'.",
+                    'message': f"Picking type '{picking_type_name}' with location_id '{location_id}' not found for company '{company.name}'."
                 }
 
-            # 🔎 Validate all products first
-            missing_products = []
-            for line in order_line:
-                product_code = line.get('product_code')
-                product_id = env['product.product'].sudo().search([
-                    ('default_code', '=', product_code),
-                    '|',
-                    ('company_id', '=', company_id),
-                    ('company_id', '=', False)
-                ], limit=1)
-                if not product_id:
-                    missing_products.append(product_code)
-
-            if missing_products:
+            # ✅ Validate order_line not empty
+            if not order_line:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Products with codes {', '.join(missing_products)} not found for company '{company_name_display}'. Purchase Order creation cancelled.",
+                    'message': "Order lines cannot be empty."
                 }
 
-            # 🧾 Build purchase order lines
-            purchase_order_lines = []
-            for line in order_line:
+            # ✅ Validate all products dengan pengecekan company eksplisit
+            missing_products = []
+            invalid_products = []
+            invalid_quantities = []
+            missing_taxes = []
+            
+            for idx, line in enumerate(order_line):
                 product_code = line.get('product_code')
                 product_uom_qty = line.get('product_uom_qty')
                 price_unit = line.get('price_unit')
                 taxes_name = line.get('taxes_ids')
+                
+                # Validate required fields in order line
+                if not product_code:
+                    missing_products.append(f"Line {idx + 1}: missing product_code")
+                    continue
+                
+                if product_uom_qty is None:
+                    invalid_quantities.append(f"{product_code}: missing quantity")
+                    continue
+                
+                if price_unit is None:
+                    invalid_quantities.append(f"{product_code}: missing price_unit")
+                    continue
+                
+                try:
+                    qty = float(product_uom_qty)
+                    if qty <= 0:
+                        invalid_quantities.append(f"{product_code}: quantity must be positive")
+                    
+                    price = float(price_unit)
+                    if price < 0:
+                        invalid_quantities.append(f"{product_code}: price_unit cannot be negative")
+                except (ValueError, TypeError):
+                    invalid_quantities.append(f"{product_code}: invalid number format")
+                    continue
+                
+                # Validate product
+                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                
+                if not product_id:
+                    missing_products.append(product_code)
+                elif product_id.company_id and product_id.company_id.id != company_id:
+                    invalid_products.append(f"{product_code} (belongs to {product_id.company_id.name})")
+                
+                # Validate tax jika ada
+                if taxes_name:
+                    tax = env['account.tax'].sudo().search([
+                        ('name', '=', taxes_name),
+                        ('company_id', '=', company_id)
+                    ], limit=1)
+                    if not tax:
+                        missing_taxes.append(f"{taxes_name} (for product {product_code})")
+
+            # ✅ Consolidated error messages
+            errors = []
+            if missing_products:
+                errors.append(f"Products not found: {', '.join(missing_products)}")
+            if invalid_products:
+                errors.append(f"Products not in company: {', '.join(invalid_products)}")
+            if invalid_quantities:
+                errors.append(f"Invalid values: {', '.join(invalid_quantities)}")
+            if missing_taxes:
+                errors.append(f"Taxes not found: {', '.join(missing_taxes)}")
+            
+            if errors:
+                return {
+                    'status': "Failed",
+                    'code': 400,
+                    'message': "; ".join(errors)
+                }
+
+            # ✅ Build purchase order lines
+            purchase_order_lines = []
+            for line in order_line:
+                product_code = line.get('product_code')
+                product_uom_qty = float(line.get('product_uom_qty'))
+                price_unit = float(line.get('price_unit'))
+                taxes_name = line.get('taxes_ids')
                 vit_line_number_sap = line.get('line_number_sap')
 
-                # Validate tax
-                tax = env['account.tax'].sudo().search([
-                    ('name', '=', taxes_name),
-                    ('company_id', '=', company_id)
-                ], limit=1)
-                if not tax:
-                    return {
-                        'status': "Failed",
-                        'code': 400,
-                        'message': f"Tax '{taxes_name}' not found for company '{company_name_display}'.",
-                    }
+                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
 
-                product_id = env['product.product'].sudo().search([
-                    ('default_code', '=', product_code),
-                    '|',
-                    ('company_id', '=', company_id),
-                    ('company_id', '=', False)
-                ], limit=1)
-
-                purchase_order_line = {
+                po_line = {
                     'name': product_id.name,
                     'product_id': product_id.id,
-                    'product_qty': float(product_uom_qty),
-                    'price_unit': float(price_unit),
-                    'taxes_id': [(6, 0, [tax.id])],
+                    'product_qty': product_uom_qty,
+                    'price_unit': price_unit,
                     'vit_line_number_sap': vit_line_number_sap,
                     'product_uom': product_id.uom_id.id,
                 }
-                purchase_order_lines.append((0, 0, purchase_order_line))
+                
+                # Add tax if provided
+                if taxes_name:
+                    tax = env['account.tax'].sudo().search([
+                        ('name', '=', taxes_name),
+                        ('company_id', '=', company_id)
+                    ], limit=1)
+                    po_line['taxes_id'] = [(6, 0, [tax.id])]
+                
+                purchase_order_lines.append((0, 0, po_line))
 
-            # 📝 Create purchase order
+            # Create purchase order
             purchase_order = env['purchase.order'].sudo().create({
                 'partner_id': customer_id,
                 'partner_ref': vendor_reference,
@@ -2826,10 +2913,10 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                 'order_line': purchase_order_lines,
             })
 
-            # ✅ Confirm purchase order
+            # Confirm purchase order
             purchase_order.button_confirm()
 
-            # 🔄 Update related pickings
+            # ✅ Update related pickings dengan company yang benar
             picking_ids = env['stock.picking'].sudo().search([('purchase_id', '=', purchase_order.id)])
             if picking_ids:
                 for picking in picking_ids:
@@ -2845,9 +2932,11 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                 'code': 200,
                 'status': 'success',
                 'message': 'Purchase Order created and validated successfully',
-                'id': purchase_order.id,
-                'doc_num': purchase_order.name,
-                'company_name': purchase_order.company_id.name
+                'data': {
+                    'id': purchase_order.id,
+                    'doc_num': purchase_order.name,
+                    'company_name': purchase_order.company_id.name
+                }
             }
 
         except Exception as e:
@@ -2856,5 +2945,5 @@ class POSTPurchaseOrderFromSAP(http.Controller):
             return {
                 'status': "Failed",
                 'code': 500,
-                'message': f"Failed to create Purchase Order: {str(e)}",
+                'message': f"Failed to create Purchase Order: {str(e)}"
             }
