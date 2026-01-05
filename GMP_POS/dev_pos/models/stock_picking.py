@@ -14,6 +14,29 @@ class StockPicking(models.Model):
     target_location = fields.Many2one('stock.location', string="Target Location")
     stock_type = fields.Many2one('master.type', string="Stock Type")
     related_picking_id = fields.Many2one('stock.picking', string="Related Transfer", readonly=True, tracking=True)
+    gm_type_transfer = fields.Selection([
+        ('ts_out', 'TS Out'),
+        ('ts_in', 'TS In'),
+    ], string="Transfer Type", compute="_compute_gm_type_transfer", store=True, tracking=True)
+
+    @api.depends('location_id', 'location_dest_id', 'location_id.usage', 'location_dest_id.usage')
+    def _compute_gm_type_transfer(self):
+        """
+        Automatically determine transfer type based on Transit location:
+        - If destination location usage is 'transit' -> TS Out
+        - If source location usage is 'transit' -> TS In
+        """
+        for record in self:
+            gm_type = False
+            
+            # Check if destination location usage is 'transit'
+            if record.location_dest_id and record.location_dest_id.usage == 'transit':
+                gm_type = 'ts_out'
+            # Check if source location usage is 'transit'
+            elif record.location_id and record.location_id.usage == 'transit':
+                gm_type = 'ts_in'
+            
+            record.gm_type_transfer = gm_type
 
     # def write(self, vals):
     #     # Cek jika status sudah ready atau done dan mencoba mengubah field yang dibatasi
