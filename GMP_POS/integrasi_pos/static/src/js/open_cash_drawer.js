@@ -10,6 +10,7 @@ import { OrderReceipt } from "@point_of_sale/app/screens/receipt_screen/receipt/
 import { ConnectionLostError } from "@web/core/network/rpc_service";
 import { Orderline } from "@point_of_sale/app/store/models";
 import { Order } from "@point_of_sale/app/store/models";
+import { ConfirmPopup } from "@point_of_sale/app/utils/confirm_popup/confirm_popup";
 
 // ========== PATCH UNTUK HARGA ASLI ==========
 
@@ -98,8 +99,8 @@ async function loadConfig() {
             console.error("❌ Failed to load config.json");
             CONFIG = {
                 api: {
-                    baseURL: "http://pos-mc.visi-intech.com",
-                    authorization: "03df61505b28cce167036aac80ab16e5cdc51a3165a11cc1246e09db6c163a53",
+                    baseURL: "http://217.216.75.141/",
+                    authorization: "89df6b08927cf9fcd25ddb812ba043d1273f5f20",
                     timeout: 10000,
                     serverName: "MC"
                 },
@@ -119,8 +120,8 @@ async function loadConfig() {
         console.error("❌ Error loading config:", error);
         CONFIG = {
             api: {
-                baseURL: "http://pos-mc.visi-intech.com",
-                authorization: "03df61505b28cce167036aac80ab16e5cdc51a3165a11cc1246e09db6c163a53",
+                baseURL: "http://217.216.75.141/",
+                authorization: "89df6b08927cf9fcd25ddb812ba043d1273f5f20",
                 timeout: 10000,
                 serverName: "MC"
             },
@@ -595,58 +596,88 @@ patch(PaymentScreen.prototype, {
             }
         }
 
-        // ========== VALIDATE COUPONS IS_USED STATUS ==========
+        // ========== ✅ VALIDATE COUPONS IS_USED STATUS (NON-BLOCKING) ==========
         const activatedCoupons = this.currentOrder.codeActivatedCoupons || [];
         
         if (activatedCoupons.length > 0) {
             console.group("🎫 VALIDATING COUPON IS_USED STATUS");
             console.log("Found", activatedCoupons.length, "activated coupons");
 
+            // ✅ Fetch Master Server URL (don't block if fails)
             if (!this._masterServerURL) {
                 this._masterServerURL = await fetchMasterServerURL();
             }
 
             if (!this._masterServerURL) {
-                await this.popup.add(ErrorPopup, {
-                    title: "Konfigurasi Error",
-                    body: "Tidak dapat menemukan konfigurasi Master Server untuk validasi coupon.\n\nSilakan hubungi administrator.",
+                // ✅ WARNING ONLY - ASK USER TO CONTINUE
+                console.warn("⚠️ Master Server tidak ditemukan, validasi coupon dilewati");
+                
+                const { confirmed } = await this.popup.add(ConfirmPopup, {
+                    title: "⚠️ Peringatan Konfigurasi",
+                    body: "Tidak dapat menemukan konfigurasi Master Server untuk validasi coupon.\n\n" +
+                        "Validasi coupon akan dilewati dan order akan tetap diproses.\n\n" +
+                        "Apakah Anda ingin melanjutkan?",
+                    confirmText: "Ya, Lanjutkan",
+                    cancelText: "Batal"
                 });
-                console.groupEnd();
-                console.groupEnd();
-                return;
-            }
 
-            for (const coupon of activatedCoupons) {
-                console.log(`Checking coupon: ${coupon.code} (ID: ${coupon.id})`);
-                
-                const checkResult = await checkCouponIsUsed(this._masterServerURL, coupon.code);
-                
-                if (!checkResult.success) {
-                    await this.popup.add(ErrorPopup, {
-                        title: "Error Validasi Coupon",
-                        body: `Gagal memvalidasi coupon ${coupon.code}.\n\nError: ${checkResult.error}\n\nSilakan coba lagi atau hubungi administrator.`,
-                    });
+                if (!confirmed) {
+                    console.log("❌ User cancelled order");
                     console.groupEnd();
                     console.groupEnd();
                     return;
                 }
+                
+                console.log("✅ User confirmed to continue without coupon validation");
+                console.groupEnd();
+                
+                // ✅ Skip coupon validation, continue to next steps
+            } else {
+                // ✅ Master Server found, proceed with validation
+                for (const coupon of activatedCoupons) {
+                    console.log(`Checking coupon: ${coupon.code} (ID: ${coupon.id})`);
+                    
+                    const checkResult = await checkCouponIsUsed(this._masterServerURL, coupon.code);
+                    
+                    if (!checkResult.success) {
+                        // ✅ API error - warning only, ask user
+                        console.warn(`⚠️ Failed to validate coupon ${coupon.code}: ${checkResult.error}`);
+                        
+                        const { confirmed } = await this.popup.add(ConfirmPopup, {
+                            title: "⚠️ Error Validasi Coupon",
+                            body: `Gagal memvalidasi coupon ${coupon.code}.\n\n` +
+                                `Error: ${checkResult.error}\n\n` +
+                                `Apakah Anda ingin melanjutkan tanpa validasi coupon ini?`,
+                            confirmText: "Ya, Lanjutkan",
+                            cancelText: "Batal"
+                        });
 
-                if (checkResult.isUsed) {
-                    console.warn(`❌ Coupon ${coupon.code} sudah digunakan!`);
-                    await this.popup.add(ErrorPopup, {
-                        title: "Coupon Sudah Digunakan",
-                        body: `Coupon ${coupon.code} sudah pernah digunakan dan tidak dapat digunakan lagi.\n\nSilakan batalkan coupon ini dari order.`,
-                    });
-                    console.groupEnd();
-                    console.groupEnd();
-                    return;
+                        if (!confirmed) {
+                            console.groupEnd();
+                            console.groupEnd();
+                            return;
+                        }
+                        
+                        continue; // Skip to next coupon
+                    }
+
+                    if (checkResult.isUsed) {
+                        console.warn(`❌ Coupon ${coupon.code} sudah digunakan!`);
+                        await this.popup.add(ErrorPopup, {
+                            title: "Coupon Sudah Digunakan",
+                            body: `Coupon ${coupon.code} sudah pernah digunakan dan tidak dapat digunakan lagi.\n\nSilakan batalkan coupon ini dari order.`,
+                        });
+                        console.groupEnd();
+                        console.groupEnd();
+                        return;
+                    }
+
+                    console.log(`✅ Coupon ${coupon.code} valid (belum digunakan)`);
                 }
 
-                console.log(`✅ Coupon ${coupon.code} valid (belum digunakan)`);
+                console.log("✅ All coupons validation passed");
+                console.groupEnd();
             }
-
-            console.log("✅ All coupons validation passed");
-            console.groupEnd();
         }
 
         // ========== VALIDATE POINT REDEMPTIONS ==========
@@ -678,7 +709,7 @@ patch(PaymentScreen.prototype, {
             console.log("Total points per coupon:", pointsPerCoupon);
 
             if (Object.keys(pointsPerCoupon).length === 0) {
-                console.log("ℹ️ No valid loyalty cards to validate (all rewards are system-generated)");
+                console.log("ℹ️ No valid loyalty cards to validate");
                 console.groupEnd();
             } else {
                 let validationFailed = false;
@@ -804,8 +835,8 @@ patch(PaymentScreen.prototype, {
             }
         }
 
-        // ========== UPDATE COUPON IS_USED STATUS ==========
-        if (syncSuccess && activatedCoupons.length > 0) {
+        // ========== ✅ UPDATE COUPON IS_USED STATUS (NON-BLOCKING) ==========
+        if (syncSuccess && activatedCoupons.length > 0 && this._masterServerURL) {
             console.group("🔄 UPDATING COUPON IS_USED STATUS");
             
             for (const coupon of activatedCoupons) {

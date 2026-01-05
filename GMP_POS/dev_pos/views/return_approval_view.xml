@@ -11,6 +11,7 @@
                   decoration-danger="gm_status == 'rejected'"
                   decoration-muted="gm_status == 'draft'">
                 <field name="gm_doc_num" decoration-bf="1"/>
+                <field name="company_id" groups="base.group_multi_company"/>
                 <field name="gm_creation_date"/>
                 <field name="gm_requested_by" widget="many2one_avatar_user"/>
                 <field name="gm_pos_order_id"/>
@@ -97,6 +98,9 @@
                     
                     <group>
                         <group string="Request Information">
+                            <field name="company_id" groups="base.group_multi_company" 
+                                   options="{'no_create': True}"
+                                   readonly="gm_status != 'draft'"/>
                             <field name="gm_requested_by" readonly="1"/>
                             <field name="gm_creation_date" readonly="1"/>
                             <field name="gm_pos_order_id" readonly="1"/>
@@ -167,6 +171,7 @@
         <field name="arch" type="xml">
             <kanban class="o_kanban_mobile">
                 <field name="gm_doc_num"/>
+                <field name="company_id"/>
                 <field name="gm_status"/>
                 <field name="gm_requested_by"/>
                 <field name="gm_creation_date"/>
@@ -179,6 +184,9 @@
                                     <strong class="o_kanban_record_title">
                                         <field name="gm_doc_num"/>
                                     </strong>
+                                    <span class="text-muted" groups="base.group_multi_company">
+                                        <field name="company_id"/>
+                                    </span>
                                 </div>
                                 <field name="gm_status" widget="label_selection" 
                                        options="{'classes': {
@@ -213,6 +221,7 @@
         <field name="arch" type="xml">
             <search string="Return Approvals">
                 <field name="gm_doc_num"/>
+                <field name="company_id" groups="base.group_multi_company"/>
                 <field name="gm_requested_by"/>
                 <field name="gm_pos_order_id"/>
                 <field name="gm_status"/>
@@ -235,6 +244,7 @@
                 <filter string="Creation Date" name="creation_date" date="gm_creation_date"/>
                 
                 <group expand="0" string="Group By">
+                    <filter string="Company" name="group_company" context="{'group_by': 'company_id'}" groups="base.group_multi_company"/>
                     <filter string="Status" name="group_status" context="{'group_by': 'gm_status'}"/>
                     <filter string="Requested By" name="group_requested" context="{'group_by': 'gm_requested_by'}"/>
                     <filter string="Creation Date" name="group_creation" context="{'group_by': 'gm_creation_date'}"/>

@@ -2278,9 +2278,6 @@ class POSTGoodsReceipt(http.Controller):
             company_id = company.id
             company_name_display = company.name
 
-            # ❌ HAPUS context switching - ini penyebab masalahnya!
-            # env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
-
             # Validate if Goods Receipt already exists
             existing_goods_receipts = env['stock.picking'].sudo().search([
                 ('vit_trxid', '=', transaction_id), 
@@ -2344,31 +2341,28 @@ class POSTGoodsReceipt(http.Controller):
                     'message': f"Destination location with ID {location_dest_id} belongs to company '{dest_location.company_id.name}', not '{company_name_display}'."
                 }
 
-            # ✅ Validate all products first - cek juga company-nya
+            # ✅ Validate all products first - cek juga company-nya (termasuk shared products)
             missing_products = []
-            invalid_products = []
             
             for line in move_lines:
                 product_code = line.get('product_code')
-                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                
+                # ✅ PERBAIKAN: Cari produk yang milik company ini atau shared
+                product_id = env['product.product'].sudo().search([
+                    ('default_code', '=', product_code),
+                    '|',
+                    ('company_id', '=', company_id),
+                    ('company_id', '=', False)
+                ], limit=1)
                 
                 if not product_id:
                     missing_products.append(product_code)
-                elif product_id.company_id and product_id.company_id.id != company_id:
-                    invalid_products.append(f"{product_code} (belongs to {product_id.company_id.name})")
 
             if missing_products:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Products with codes {', '.join(missing_products)} not found. Goods Receipt creation cancelled."
-                }
-            
-            if invalid_products:
-                return {
-                    'status': "Failed",
-                    'code': 400,
-                    'message': f"Products {', '.join(invalid_products)} do not belong to company '{company_name_display}'. Goods Receipt creation cancelled."
+                    'message': f"Products with codes {', '.join(missing_products)} not found or not accessible for company '{company_name_display}'. Goods Receipt creation cancelled."
                 }
 
             # ✅ Create Goods Receipt - pastikan company_id yang benar
@@ -2389,7 +2383,14 @@ class POSTGoodsReceipt(http.Controller):
             for line in move_lines:
                 product_code = line.get('product_code')
                 product_uom_qty = line.get('product_uom_qty')
-                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                
+                # ✅ PERBAIKAN: Cari produk dengan filter yang sama (milik company atau shared)
+                product_id = env['product.product'].sudo().search([
+                    ('default_code', '=', product_code),
+                    '|',
+                    ('company_id', '=', company_id),
+                    ('company_id', '=', False)
+                ], limit=1)
 
                 move_vals = {
                     'name': product_id.name,
@@ -2485,9 +2486,6 @@ class POSTGoodsIssue(http.Controller):
             
             company_id = company.id
 
-            # ❌ HAPUS context switching
-            # env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
-
             # Check duplicate Goods Issue
             existing_gi = env['stock.picking'].sudo().search([
                 ('vit_trxid', '=', transaction_id), 
@@ -2497,7 +2495,7 @@ class POSTGoodsIssue(http.Controller):
             
             if existing_gi:    
                 return {
-                    'code': 409,  # ✅ 409 Conflict untuk duplicate
+                    'code': 409,
                     'status': 'failed',
                     'message': 'Goods Issue already exists',
                     'data': {
@@ -2561,9 +2559,8 @@ class POSTGoodsIssue(http.Controller):
                     'message': "Move lines cannot be empty."
                 }
 
-            # ✅ Validate products dengan pengecekan company eksplisit
+            # ✅ PERBAIKAN: Validate products - terima produk milik company ATAU shared
             missing_products = []
-            invalid_products = []
             invalid_quantities = []
             
             for idx, line in enumerate(move_lines):
@@ -2586,19 +2583,21 @@ class POSTGoodsIssue(http.Controller):
                     invalid_quantities.append(f"{product_code}: invalid quantity format")
                     continue
                 
-                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                # ✅ PERBAIKAN: Cari produk yang milik company ini atau shared
+                product_id = env['product.product'].sudo().search([
+                    ('default_code', '=', product_code),
+                    '|',
+                    ('company_id', '=', company_id),
+                    ('company_id', '=', False)
+                ], limit=1)
                 
                 if not product_id:
                     missing_products.append(product_code)
-                elif product_id.company_id and product_id.company_id.id != company_id:
-                    invalid_products.append(f"{product_code} (belongs to {product_id.company_id.name})")
 
             # ✅ Consolidated error messages
             errors = []
             if missing_products:
-                errors.append(f"Products not found: {', '.join(missing_products)}")
-            if invalid_products:
-                errors.append(f"Products not in company: {', '.join(invalid_products)}")
+                errors.append(f"Products not found or not accessible for company '{company.name}': {', '.join(missing_products)}")
             if invalid_quantities:
                 errors.append(f"Invalid quantities: {', '.join(invalid_quantities)}")
             
@@ -2626,11 +2625,18 @@ class POSTGoodsIssue(http.Controller):
                 
             goods_issue = env['stock.picking'].sudo().create(gi_vals)
 
-            # ✅ Create move lines langsung
+            # ✅ PERBAIKAN: Create move lines dengan filter yang sama
             for line in move_lines:
                 product_code = line.get('product_code')
                 product_uom_qty = float(line.get('product_uom_qty'))
-                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                
+                # ✅ Cari produk yang milik company ini atau shared
+                product_id = env['product.product'].sudo().search([
+                    ('default_code', '=', product_code),
+                    '|',
+                    ('company_id', '=', company_id),
+                    ('company_id', '=', False)
+                ], limit=1)
 
                 env['stock.move'].sudo().create({
                     'name': product_id.name,
@@ -2689,7 +2695,7 @@ class POSTPurchaseOrderFromSAP(http.Controller):
             data = request.get_json_data()
             
             # ✅ Validasi input fields yang required
-            required_fields = ['company_name', 'customer_code', 'vendor_reference', 'currency_id', 
+            required_fields = ['company_name', 'customer_code', 'currency_id', 
                              'date_order', 'transaction_id', 'expected_arrival', 'picking_type', 
                              'location_id', 'order_line']
             missing_fields = [f for f in required_fields if not data.get(f)]
@@ -2723,9 +2729,6 @@ class POSTPurchaseOrderFromSAP(http.Controller):
             
             company_id = company.id
 
-            # ❌ HAPUS context switching
-            # env = env(context=dict(env.context, allowed_company_ids=[company_id], company_id=company_id))
-
             # Check duplicate PO
             existing_po = env['purchase.order'].sudo().search([
                 ('vit_trxid', '=', transaction_id),
@@ -2734,7 +2737,7 @@ class POSTPurchaseOrderFromSAP(http.Controller):
 
             if existing_po:
                 return {
-                    'code': 409,  # ✅ 409 Conflict untuk duplicate
+                    'code': 409,
                     'status': 'failed',
                     'message': 'Purchase Order already exists',
                     'data': {
@@ -2744,22 +2747,19 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                     }
                 }
 
-            # ✅ Validate customer (vendor) dengan pengecekan company eksplisit
-            customer = env['res.partner'].sudo().search([('customer_code', '=', customer_code)], limit=1)
+            # ✅ Validate customer (vendor) - terima partner milik company ATAU shared
+            customer = env['res.partner'].sudo().search([
+                ('customer_code', '=', customer_code),
+                '|',
+                ('company_id', '=', company_id),
+                ('company_id', '=', False)
+            ], limit=1)
             
             if not customer:
                 return {
                     'status': "Failed",
                     'code': 400,
-                    'message': f"Customer with code '{customer_code}' not found."
-                }
-            
-            # ✅ Cek apakah partner milik company atau shared
-            if customer.company_id and customer.company_id.id != company_id:
-                return {
-                    'status': "Failed",
-                    'code': 400,
-                    'message': f"Customer '{customer_code}' belongs to '{customer.company_id.name}', not '{company.name}'."
+                    'message': f"Customer with code '{customer_code}' not found or not accessible for company '{company.name}'."
                 }
             
             customer_id = customer.id
@@ -2796,9 +2796,8 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                     'message': "Order lines cannot be empty."
                 }
 
-            # ✅ Validate all products dengan pengecekan company eksplisit
+            # ✅ PERBAIKAN: Validate all products - terima produk milik company ATAU shared
             missing_products = []
-            invalid_products = []
             invalid_quantities = []
             missing_taxes = []
             
@@ -2833,13 +2832,16 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                     invalid_quantities.append(f"{product_code}: invalid number format")
                     continue
                 
-                # Validate product
-                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                # ✅ PERBAIKAN: Validate product - terima milik company atau shared
+                product_id = env['product.product'].sudo().search([
+                    ('default_code', '=', product_code),
+                    '|',
+                    ('company_id', '=', company_id),
+                    ('company_id', '=', False)
+                ], limit=1)
                 
                 if not product_id:
                     missing_products.append(product_code)
-                elif product_id.company_id and product_id.company_id.id != company_id:
-                    invalid_products.append(f"{product_code} (belongs to {product_id.company_id.name})")
                 
                 # Validate tax jika ada
                 if taxes_name:
@@ -2853,9 +2855,7 @@ class POSTPurchaseOrderFromSAP(http.Controller):
             # ✅ Consolidated error messages
             errors = []
             if missing_products:
-                errors.append(f"Products not found: {', '.join(missing_products)}")
-            if invalid_products:
-                errors.append(f"Products not in company: {', '.join(invalid_products)}")
+                errors.append(f"Products not found or not accessible for company '{company.name}': {', '.join(missing_products)}")
             if invalid_quantities:
                 errors.append(f"Invalid values: {', '.join(invalid_quantities)}")
             if missing_taxes:
@@ -2868,7 +2868,7 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                     'message': "; ".join(errors)
                 }
 
-            # ✅ Build purchase order lines
+            # ✅ PERBAIKAN: Build purchase order lines dengan filter yang sama
             purchase_order_lines = []
             for line in order_line:
                 product_code = line.get('product_code')
@@ -2877,7 +2877,13 @@ class POSTPurchaseOrderFromSAP(http.Controller):
                 taxes_name = line.get('taxes_ids')
                 vit_line_number_sap = line.get('line_number_sap')
 
-                product_id = env['product.product'].sudo().search([('default_code', '=', product_code)], limit=1)
+                # ✅ Cari produk yang milik company ini atau shared
+                product_id = env['product.product'].sudo().search([
+                    ('default_code', '=', product_code),
+                    '|',
+                    ('company_id', '=', company_id),
+                    ('company_id', '=', False)
+                ], limit=1)
 
                 po_line = {
                     'name': product_id.name,

@@ -79,6 +79,16 @@ class ReturnApproval(models.Model):
         default='New',
         tracking=True
     )
+    company_id = fields.Many2one(
+        'res.company', 
+        string='Company', 
+        required=True,
+        index=True, 
+        default=lambda self: self.env.company,
+        tracking=True,
+        states={'draft': [('readonly', False)]},
+        readonly=True
+    )
     gm_pos_order_id = fields.Many2one(
         'pos.order', 
         string="Original POS Order",
@@ -197,6 +207,12 @@ class ReturnApproval(models.Model):
                     total += abs(line.gm_qty * original_line[0].price_unit)
             record.gm_total_amount = total
     
+    @api.onchange('gm_pos_order_id')
+    def _onchange_pos_order_id(self):
+        """Auto-update company when POS order is selected"""
+        if self.gm_pos_order_id:
+            self.company_id = self.gm_pos_order_id.company_id
+    
     @api.depends('gm_status', 'gm_history_ids')
     def _compute_current_level(self):
         for record in self:
@@ -221,8 +237,21 @@ class ReturnApproval(models.Model):
     
     @api.model
     def create(self, vals):
+        # ALWAYS get company_id from POS order (required field)
+        if vals.get('gm_pos_order_id'):
+            pos_order = self.env['pos.order'].browse(vals['gm_pos_order_id'])
+            vals['company_id'] = pos_order.company_id.id
+        elif not vals.get('company_id'):
+            # Fallback to current company only if no POS order specified
+            vals['company_id'] = self.env.company.id
+        
+        # Generate sequence per company
         if vals.get('gm_doc_num', 'New') == 'New':
-            vals['gm_doc_num'] = self.env['ir.sequence'].next_by_code('return.approval') or 'New'
+            company_id = vals.get('company_id', self.env.company.id)
+            vals['gm_doc_num'] = self.env['ir.sequence'].with_context(
+                force_company=company_id
+            ).next_by_code('return.approval') or 'New'
+        
         return super(ReturnApproval, self).create(vals)
     
     def action_submit_approval(self):
@@ -370,6 +399,7 @@ class ReturnApproval(models.Model):
         # Create a copy of the order for refund
         refund_order_vals = {
             'name': original_order.name,
+            'company_id': self.company_id.id,
             'session_id': original_order.session_id.id,
             'partner_id': original_order.partner_id.id if original_order.partner_id else False,
             'date_order': fields.Datetime.now(),
@@ -438,8 +468,10 @@ class ReturnApproval(models.Model):
         refund_order_vals['amount_tax'] = total_tax
         refund_order_vals['amount_total'] = total_amount
         
-        # Create the refund order
-        refund_order = self.env['pos.order'].sudo().create(refund_order_vals)
+        # Create the refund order with company context
+        refund_order = self.env['pos.order'].with_context(
+            force_company=self.company_id.id
+        ).sudo().create(refund_order_vals)
         
         # Link refund order to this approval
         self.gm_refund_order_id = refund_order.id
@@ -535,6 +567,14 @@ class ReturnApprovalLine(models.Model):
         required=True,
         ondelete='cascade'
     )
+    company_id = fields.Many2one(
+        'res.company',
+        string='Company',
+        related='return_approval_id.company_id',
+        store=True,
+        readonly=True,
+        index=True
+    )
     gm_product_id = fields.Many2one(
         'product.product', 
         string="Product",
@@ -613,6 +653,14 @@ class ReturnApprovalHistory(models.Model):
         string="Return Approval",
         required=True,
         ondelete='cascade'
+    )
+    company_id = fields.Many2one(
+        'res.company',
+        string='Company',
+        related='return_approval_id.company_id',
+        store=True,
+        readonly=True,
+        index=True
     )
     gm_level = fields.Integer(
         string="Approval Level",
