@@ -75,11 +75,13 @@
     ],
     'assets': {
         'point_of_sale._assets_pos': [
+            'dev_pos/static/src/xml/pos_dp_paymentline.xml',
             'dev_pos/static/src/js/pos_session_load.js',
             'dev_pos/static/src/js/coupon_frontend.js',
             'dev_pos/static/src/js/return_approval_create.js',
             'dev_pos/static/src/js/pos_dp_productscreen.js',
             'dev_pos/static/src/js/pos_dp_payment.js',
+            'dev_pos/static/src/js/pos_dp_paymentline.js',
             'dev_pos/static/src/js/pos_dp_validate.js',
             'dev_pos/static/src/js/pos_sale_order.js',
         ],

@@ -550,7 +550,7 @@ class PaymentAPI(http.Controller):
                 ]
 
             # Ambil data invoice (account.move)
-            payment_invoices = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize)
+            payment_invoices = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize, order="create_date asc")
 
             jakarta_tz = pytz.timezone('Asia/Jakarta')
             data_payment_invoice = []
@@ -562,7 +562,7 @@ class PaymentAPI(http.Controller):
 
                 # Get POS order details
                 order_pos = request.env['pos.order'].sudo().search([
-                    ('vit_trxid', '=', reference),
+                    ('name', '=', reference),
                     ('state', '=', 'invoiced')
                 ], limit=1)
 
@@ -590,6 +590,11 @@ class PaymentAPI(http.Controller):
                     if not payment_date_utc:
                         continue
 
+                for order_line in order_pos.lines:
+                    item_name_dp = order_line.product_id.name
+                    item_code_dp = order_line.product_id.default_code
+                    item_dp = order_line.product_id.gm_is_dp
+
                     payment_date_jakarta = pytz.utc.localize(payment_date_utc).astimezone(jakarta_tz)
 
                     payments_data = {
@@ -604,6 +609,9 @@ class PaymentAPI(http.Controller):
                         'customer_name': payment.partner_id.name,
                         'customer_code': payment.partner_id.customer_code,
                         'payment_date': str(payment_date_jakarta),
+                        'item': item_name_dp,
+                        'item_code': item_code_dp,
+                        'is_dp': item_dp,
                         'amount': payment_line.amount,
                         'create_date': str(payment_date_jakarta),
                         'payment_method_pos_id': payment_line.payment_method_id.id,
@@ -667,11 +675,11 @@ class PaymentReturnCreditMemoAPI(http.Controller):
                 created_date_to = fields.Date.from_string(createdDateTo) if createdDateTo else fields.Date.today()
                 domain += [
                     ('create_date', '>=', created_date_from.strftime(date_format)),
-                    ('create_date', '<=', created_date_to.strftime(date_format))
+                    ('create_date', '<=', created_date_to.strftime(date_format)),
                 ]
 
             # Ambil data credit memo (account.move)
-            credit_memos = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize)
+            credit_memos = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize, order="create_date asc")
 
             jakarta_tz = pytz.timezone('Asia/Jakarta')
             data_credit_memo = []
@@ -683,7 +691,7 @@ class PaymentReturnCreditMemoAPI(http.Controller):
 
                 # Get POS order details
                 order_pos = request.env['pos.order'].sudo().search([
-                    ('vit_trxid', '=', reference),
+                    ('name', '=', reference),
                     ('state', '=', 'invoiced')
                 ], limit=1)
 
@@ -2399,7 +2407,7 @@ class InvoiceOrder(http.Controller):
 
             for order in invoice_accounting:
                 try:
-                    order_pos = request.env['pos.order'].sudo().search([('vit_trxid', '=', order.ref), ('state', '=', 'invoiced')], limit=1)
+                    order_pos = request.env['pos.order'].sudo().search([('state', '=', 'invoiced')], limit=1)
                     location_id = location = location_dest_id = location_dest = None
 
                     if order_pos:
