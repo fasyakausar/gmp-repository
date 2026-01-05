@@ -15,6 +15,7 @@
             <field name="is_integrated"/>
             <field name="is_closed"/>
             <field name="vit_trxid"/>
+            <field name="gm_type_transfer"/>
         </xpath>
         
         <!-- Field origin readonly ketika state ready/done -->

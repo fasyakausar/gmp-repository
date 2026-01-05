@@ -550,10 +550,13 @@ class PaymentAPI(http.Controller):
                 ]
 
             # Ambil data invoice (account.move)
-            payment_invoices = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize)
+            payment_invoices = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize, order="create_date asc")
 
             jakarta_tz = pytz.timezone('Asia/Jakarta')
-            data_payment_invoice = []
+            
+            # Dictionary untuk grouping berdasarkan doc_num
+            # Key: doc_num, Value: order info + payments list
+            order_groups = {}
 
             for payment in payment_invoices:
                 reference = payment.ref
@@ -562,7 +565,7 @@ class PaymentAPI(http.Controller):
 
                 # Get POS order details
                 order_pos = request.env['pos.order'].sudo().search([
-                    ('vit_trxid', '=', reference),
+                    ('name', '=', reference),
                     ('state', '=', 'invoiced')
                 ], limit=1)
 
@@ -585,17 +588,41 @@ class PaymentAPI(http.Controller):
 
                 pos_payments = request.env['pos.payment'].sudo().search(payment_domain)
 
-                for payment_line in pos_payments:
-                    payment_date_utc = payment_line.payment_date
-                    if not payment_date_utc:
-                        continue
+                # Ambil info items dari order lines (hanya sekali, tidak di loop untuk setiap payment)
+                has_dp = False
+                item_details = []
+                
+                for order_line in order_pos.lines:
+                    item_name = order_line.product_id.name
+                    item_code = order_line.product_id.default_code
+                    is_dp = order_line.product_id.gm_is_dp
+                    
+                    if is_dp:
+                        has_dp = True
+                    
+                    item_details.append({
+                        'name': item_name,
+                        'code': item_code,
+                        'is_dp': is_dp
+                    })
+                
+                # Tentukan item yang akan ditampilkan
+                display_item = None
+                if has_dp:
+                    for item in item_details:
+                        if item['is_dp']:
+                            display_item = item
+                            break
+                else:
+                    display_item = item_details[0] if item_details else {'name': '', 'code': '', 'is_dp': False}
 
-                    payment_date_jakarta = pytz.utc.localize(payment_date_utc).astimezone(jakarta_tz)
+                doc_num = order_pos.name
 
-                    payments_data = {
-                        'id': payment_line.id,  # ambil dari pos.payment
-                        'doc_num': order_pos.name,
-                        'is_integrated': payment_line.is_integrated,
+                # Jika doc_num belum ada di order_groups, buat entry baru
+                if doc_num not in order_groups:
+                    order_groups[doc_num] = {
+                        'doc_num': doc_num,
+                        'is_integrated': False,  # Will be updated if any payment is integrated
                         'invoice': payment.name,
                         'invoice_id': payment.id,
                         'location_id': location_id,
@@ -603,17 +630,95 @@ class PaymentAPI(http.Controller):
                         'customer_id': payment.partner_id.id,
                         'customer_name': payment.partner_id.name,
                         'customer_code': payment.partner_id.customer_code,
-                        'payment_date': str(payment_date_jakarta),
-                        'amount': payment_line.amount,
-                        'create_date': str(payment_date_jakarta),
-                        'payment_method_pos_id': payment_line.payment_method_id.id,
-                        'payment_method_pos': payment_line.payment_method_id.name,
-                        'payment_method_journal_id': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.id,
-                        'payment_method_journal_name': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.name,
+                        'item': display_item['name'] if display_item else '',
+                        'item_code': display_item['code'] if display_item else '',
+                        'is_dp': display_item['is_dp'] if display_item else False,
                         'company_id': payment.company_id.id,
-                        'company_name': payment.company_id.name
+                        'company_name': payment.company_id.name,
+                        'payments': {}  # Dict untuk grouping payment methods
                     }
-                    data_payment_invoice.append(payments_data)
+
+                # Group payments by payment_method_id di dalam doc_num ini
+                for payment_line in pos_payments:
+                    payment_date_utc = payment_line.payment_date
+                    if not payment_date_utc:
+                        continue
+
+                    payment_date_jakarta = pytz.utc.localize(payment_date_utc).astimezone(jakarta_tz)
+                    payment_method_id = payment_line.payment_method_id.id
+
+                    # Update is_integrated flag jika ada payment yang integrated
+                    if payment_line.is_integrated:
+                        order_groups[doc_num]['is_integrated'] = True
+
+                    # Jika payment method sudah ada di doc_num ini, sum amount-nya
+                    if payment_method_id in order_groups[doc_num]['payments']:
+                        order_groups[doc_num]['payments'][payment_method_id]['amount'] += payment_line.amount
+                        order_groups[doc_num]['payments'][payment_method_id]['payment_ids'].append(payment_line.id)
+                        # Update is_integrated jika ada payment yang integrated
+                        if payment_line.is_integrated:
+                            order_groups[doc_num]['payments'][payment_method_id]['is_integrated'] = True
+                    else:
+                        # Buat entry baru untuk payment method ini
+                        order_groups[doc_num]['payments'][payment_method_id] = {
+                            'payment_ids': [payment_line.id],
+                            'payment_date': str(payment_date_jakarta),
+                            'amount': payment_line.amount,
+                            'create_date': str(payment_date_jakarta),
+                            'payment_method_pos_id': payment_line.payment_method_id.id,
+                            'payment_method_pos': payment_line.payment_method_id.name,
+                            'payment_method_journal_id': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.id if payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids else False,
+                            'payment_method_journal_name': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.name if payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids else '',
+                            'is_integrated': payment_line.is_integrated,  # Tambahkan is_integrated per payment
+                        }
+
+            # Konversi order_groups dict menjadi list dengan struktur nested
+            data_payment_invoice = []
+            for doc_num, order_data in order_groups.items():
+                # Skip jika tidak ada payments yang sesuai filter
+                if not order_data['payments']:
+                    continue
+                
+                # Jika filter is_integrated diterapkan, skip order yang tidak sesuai
+                if is_integrated is not None:
+                    is_integrated_bool = str(is_integrated).lower() == 'true'
+                    if order_data['is_integrated'] != is_integrated_bool:
+                        continue
+                
+                # Konversi payments dict menjadi list
+                payments_list = []
+                for payment_method_id, payment_info in order_data['payments'].items():
+                    payments_list.append({
+                        'id': payment_info['payment_ids'][0],  # Gunakan ID pertama
+                        'payment_date': payment_info['payment_date'],
+                        'amount': payment_info['amount'],
+                        'create_date': payment_info['create_date'],
+                        'payment_method_pos_id': payment_info['payment_method_pos_id'],
+                        'payment_method_pos': payment_info['payment_method_pos'],
+                        'payment_method_journal_id': payment_info['payment_method_journal_id'],
+                        'payment_method_journal_name': payment_info['payment_method_journal_name'],
+                        'is_integrated': payment_info['is_integrated'],  # Tambahkan is_integrated di response
+                    })
+
+                # Buat final structure
+                order_entry = {
+                    'doc_num': order_data['doc_num'],
+                    'is_integrated': order_data['is_integrated'],  # is_integrated untuk keseluruhan order
+                    'invoice': order_data['invoice'],
+                    'invoice_id': order_data['invoice_id'],
+                    'location_id': order_data['location_id'],
+                    'location': order_data['location'],
+                    'customer_id': order_data['customer_id'],
+                    'customer_name': order_data['customer_name'],
+                    'customer_code': order_data['customer_code'],
+                    'item': order_data['item'],
+                    'item_code': order_data['item_code'],
+                    'is_dp': order_data['is_dp'],
+                    'company_id': order_data['company_id'],
+                    'company_name': order_data['company_name'],
+                    'payments': payments_list
+                }
+                data_payment_invoice.append(order_entry)
 
             # Update total_records
             total_records = len(data_payment_invoice)
@@ -630,7 +735,6 @@ class PaymentAPI(http.Controller):
 
         except Exception as e:
             return serialize_error_response(str(e))
-
         
 class PaymentReturnCreditMemoAPI(http.Controller):
     @http.route(['/api/payment_creditmemo/'], type='http', auth='public', methods=['GET'], csrf=False)
@@ -667,14 +771,17 @@ class PaymentReturnCreditMemoAPI(http.Controller):
                 created_date_to = fields.Date.from_string(createdDateTo) if createdDateTo else fields.Date.today()
                 domain += [
                     ('create_date', '>=', created_date_from.strftime(date_format)),
-                    ('create_date', '<=', created_date_to.strftime(date_format))
+                    ('create_date', '<=', created_date_to.strftime(date_format)),
                 ]
 
             # Ambil data credit memo (account.move)
-            credit_memos = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize)
+            credit_memos = request.env['account.move'].sudo().search(domain, limit=pageSize, offset=(page - 1) * pageSize, order="create_date asc")
 
             jakarta_tz = pytz.timezone('Asia/Jakarta')
-            data_credit_memo = []
+            
+            # Dictionary untuk grouping berdasarkan doc_num
+            # Key: doc_num, Value: order info + payments list
+            order_groups = {}
 
             for credit in credit_memos:
                 reference = credit.ref
@@ -683,7 +790,7 @@ class PaymentReturnCreditMemoAPI(http.Controller):
 
                 # Get POS order details
                 order_pos = request.env['pos.order'].sudo().search([
-                    ('vit_trxid', '=', reference),
+                    ('name', '=', reference),
                     ('state', '=', 'invoiced')
                 ], limit=1)
 
@@ -706,17 +813,13 @@ class PaymentReturnCreditMemoAPI(http.Controller):
 
                 pos_payments = request.env['pos.payment'].sudo().search(payment_domain)
 
-                for payment_line in pos_payments:
-                    payment_date_utc = payment_line.payment_date
-                    if not payment_date_utc:
-                        continue
+                doc_num = order_pos.name
 
-                    payment_date_jakarta = pytz.utc.localize(payment_date_utc).astimezone(jakarta_tz)
-
-                    payments_data = {
-                        'id': payment_line.id,  # ambil dari pos.payment
-                        'doc_num': order_pos.name,
-                        'is_integrated': payment_line.is_integrated,
+                # Jika doc_num belum ada di order_groups, buat entry baru
+                if doc_num not in order_groups:
+                    order_groups[doc_num] = {
+                        'doc_num': doc_num,
+                        'is_integrated': False,  # Will be updated if any payment is integrated
                         'invoice': credit.name,
                         'invoice_id': credit.id,
                         'location_id': location_id,
@@ -724,17 +827,89 @@ class PaymentReturnCreditMemoAPI(http.Controller):
                         'customer_id': credit.partner_id.id,
                         'customer_name': credit.partner_id.name,
                         'customer_code': credit.partner_id.customer_code,
-                        'payment_date': str(payment_date_jakarta),
-                        'amount': payment_line.amount,
-                        'create_date': str(payment_date_jakarta),
-                        'payment_method_pos_id': payment_line.payment_method_id.id,
-                        'payment_method_pos': payment_line.payment_method_id.name,
-                        'payment_method_journal_id': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.id,
-                        'payment_method_journal_name': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.name,
-                        'company_id': payment_line.company_id.id,
-                        'company_name': payment_line.company_id.name
+                        'company_id': credit.company_id.id if hasattr(credit, 'company_id') else None,
+                        'company_name': credit.company_id.name if hasattr(credit, 'company_id') and credit.company_id else '',
+                        'payments': {}  # Dict untuk grouping payment methods
                     }
-                    data_credit_memo.append(payments_data)
+
+                # Group payments by payment_method_id di dalam doc_num ini
+                for payment_line in pos_payments:
+                    payment_date_utc = payment_line.payment_date
+                    if not payment_date_utc:
+                        continue
+
+                    payment_date_jakarta = pytz.utc.localize(payment_date_utc).astimezone(jakarta_tz)
+                    payment_method_id = payment_line.payment_method_id.id
+
+                    # Update is_integrated flag jika ada payment yang integrated
+                    if payment_line.is_integrated:
+                        order_groups[doc_num]['is_integrated'] = True
+
+                    # Jika payment method sudah ada di doc_num ini, sum amount-nya
+                    if payment_method_id in order_groups[doc_num]['payments']:
+                        order_groups[doc_num]['payments'][payment_method_id]['amount'] += payment_line.amount
+                        order_groups[doc_num]['payments'][payment_method_id]['payment_ids'].append(payment_line.id)
+                        # Update is_integrated jika ada payment yang integrated
+                        if payment_line.is_integrated:
+                            order_groups[doc_num]['payments'][payment_method_id]['is_integrated'] = True
+                    else:
+                        # Buat entry baru untuk payment method ini
+                        order_groups[doc_num]['payments'][payment_method_id] = {
+                            'payment_ids': [payment_line.id],
+                            'payment_date': str(payment_date_jakarta),
+                            'amount': payment_line.amount,
+                            'create_date': str(payment_date_jakarta),
+                            'payment_method_pos_id': payment_line.payment_method_id.id,
+                            'payment_method_pos': payment_line.payment_method_id.name,
+                            'payment_method_journal_id': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.id if payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids else False,
+                            'payment_method_journal_name': payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids.payment_method_id.name if payment_line.payment_method_id.journal_id.inbound_payment_method_line_ids else '',
+                            'is_integrated': payment_line.is_integrated,  # Tambahkan is_integrated per payment
+                        }
+
+            # Konversi order_groups dict menjadi list dengan struktur nested
+            data_credit_memo = []
+            for doc_num, order_data in order_groups.items():
+                # Skip jika tidak ada payments yang sesuai filter
+                if not order_data['payments']:
+                    continue
+                
+                # Jika filter is_integrated diterapkan, skip order yang tidak sesuai
+                if is_integrated is not None:
+                    is_integrated_bool = str(is_integrated).lower() == 'true'
+                    if order_data['is_integrated'] != is_integrated_bool:
+                        continue
+                
+                # Konversi payments dict menjadi list
+                payments_list = []
+                for payment_method_id, payment_info in order_data['payments'].items():
+                    payments_list.append({
+                        'id': payment_info['payment_ids'][0],  # Gunakan ID pertama
+                        'payment_date': payment_info['payment_date'],
+                        'amount': payment_info['amount'],
+                        'create_date': payment_info['create_date'],
+                        'payment_method_pos_id': payment_info['payment_method_pos_id'],
+                        'payment_method_pos': payment_info['payment_method_pos'],
+                        'payment_method_journal_id': payment_info['payment_method_journal_id'],
+                        'payment_method_journal_name': payment_info['payment_method_journal_name'],
+                        'is_integrated': payment_info['is_integrated'],  # Tambahkan is_integrated di response
+                    })
+
+                # Buat final structure
+                order_entry = {
+                    'doc_num': order_data['doc_num'],
+                    'is_integrated': order_data['is_integrated'],  # is_integrated untuk keseluruhan order
+                    'invoice': order_data['invoice'],
+                    'invoice_id': order_data['invoice_id'],
+                    'location_id': order_data['location_id'],
+                    'location': order_data['location'],
+                    'customer_id': order_data['customer_id'],
+                    'customer_name': order_data['customer_name'],
+                    'customer_code': order_data['customer_code'],
+                    'company_id': order_data['company_id'],
+                    'company_name': order_data['company_name'],
+                    'payments': payments_list
+                }
+                data_credit_memo.append(order_entry)
 
             # Update total_records
             total_records = len(data_credit_memo)
@@ -753,7 +928,6 @@ class PaymentReturnCreditMemoAPI(http.Controller):
             return serialize_error_response(str(e))
 
 
-      
 class MasterUoMAPI(http.Controller):
     @http.route(['/api/master_uom/'], type='http', auth='public', methods=['GET'], csrf=False)
     def master_UoM_get(self, createdDateFrom=None, createdDateTo=None, pageSize=200, page=1, q=None, company_id=None, **params):
@@ -1162,7 +1336,7 @@ class MasterPoSCategoryItem(http.Controller):
         
 class MasterCustomerAPI(http.Controller):
     @http.route(['/api/master_customer/'], type='http', auth='public', methods=['GET'], csrf=False)
-    def master_customer_get(self, createdDateFrom=None, createdDateTo=None, pageSize=200, page=1, q=None, is_integrated=None, company_id=None, **params):
+    def master_customer_get(self, createdDateFrom=None, createdDateTo=None, pageSize=200, page=1, customer_code=None, is_integrated=None, company_id=None, **params):
         try:
             check_authorization()
 
@@ -1174,8 +1348,8 @@ class MasterCustomerAPI(http.Controller):
             pageSize = int(pageSize) if pageSize else 200
 
             # Build domain filters
-            if q:
-                domain += [('customer_code', '=', str(q))]
+            if customer_code:
+                domain += [('customer_code', '=', str(customer_code))]
             
             if company_id is not None:
                 try:
@@ -1196,12 +1370,8 @@ class MasterCustomerAPI(http.Controller):
                 is_integrated_bool = str(is_integrated).lower() == 'true'
                 domain += [('is_integrated', '=', is_integrated_bool)]
 
-            # Fetch data with pagination
-            if domain or (q is not None):
-                customers_data, total_records = paginate_records('res.partner', domain, pageSize, page)
-            else:
-                customers_data = request.env['res.partner'].sudo().search([])
-                total_records = len(customers_data)
+            # ✅ Fetch data with pagination - ALWAYS use domain
+            customers_data, total_records = paginate_records('res.partner', domain, pageSize, page)
 
             data_master_customer = []
             jakarta_tz = pytz.timezone('Asia/Jakarta')
@@ -1210,23 +1380,19 @@ class MasterCustomerAPI(http.Controller):
                 create_date_utc = customer.create_date
                 create_date_jakarta = pytz.utc.localize(create_date_utc).astimezone(jakarta_tz)
                 
-                # Fix: Ensure customer_code is always a string or proper value
-                customer_code = customer.customer_code if customer.customer_code else ""
-                
                 customer_data = {
                     'id': customer.id,
                     'create_date': str(create_date_jakarta),
                     'name': customer.name,
-                    'street': customer.street,
-                    'phone': customer.phone,
-                    'mobile': customer.mobile,
-                    'email': customer.email,
-                    'website': customer.website,
+                    'street': customer.street if customer.street else "",
+                    'phone': customer.phone if customer.phone else "",
+                    'mobile': customer.mobile if customer.mobile else "",
+                    'email': customer.email if customer.email else "",
+                    'website': customer.website if customer.website else "",
                     'title': customer.title.name if customer.title else "",
                     'is_integrated': customer.is_integrated,
                     'customer_rank': customer.customer_rank,
                     'supplier_rank': customer.supplier_rank,
-                    'customer_code': customer_code,
                     'property_product_pricelist_id': customer.property_product_pricelist.id if customer.property_product_pricelist else None,
                     'property_product_pricelist': customer.property_product_pricelist.name if customer.property_product_pricelist else "",
                     'property_account_receivable_id': customer.property_account_receivable_id.id if customer.property_account_receivable_id else None,
@@ -1240,6 +1406,11 @@ class MasterCustomerAPI(http.Controller):
                     'company_id': customer.company_id.id if customer.company_id else None,
                     'company_name': customer.company_id.name if customer.company_id else "",
                 }
+                
+                # ✅ Hanya tambahkan customer_code jika ada isinya
+                if customer.customer_code:
+                    customer_data['customer_code'] = customer.customer_code
+                
                 data_master_customer.append(customer_data)
 
             total_pages = (total_records + pageSize - 1) // pageSize
@@ -1258,21 +1429,21 @@ class MasterCustomerAPI(http.Controller):
         
 class MasterLocationAPI(http.Controller):
     @http.route(['/api/master_location/'], type='http', auth='public', methods=['GET'], csrf=False)
-    def master_location_get(self, createdDateFrom=None, createdDateTo=None, pageSize=200, page=1, q=None, company_id=None, **params):
+    def master_location_get(self, createdDateFrom=None, createdDateTo=None, pageSize=200, page=1, location=None, company_id=None, **params):
         try:
             check_authorization()
-
-            # if not q and (not createdDateFrom or not createdDateTo or not pageSize or not page):
-            #     raise ValidationError("One or more required parameters are missing.")
 
             if int(page) == 0:
                 return serialize_response([], 0, 0)
 
             date_format = '%Y-%m-%d'
-            domain = []  # Initialize domain here
+            domain = []
+            pageSize = int(pageSize) if pageSize else 200
 
-            if q:
-                domain += [('complete_name', 'ilike', str(q))]
+            # Build domain filters
+            if location:
+                # ✅ Filter hanya yang mengandung '/Stock' dan sesuai dengan location parameter
+                domain += ['&', ('complete_name', 'ilike', '/Stock'), ('complete_name', 'ilike', str(location))]
             
             if company_id is not None:
                 try:
@@ -1281,58 +1452,45 @@ class MasterLocationAPI(http.Controller):
                 except ValueError:
                     return serialize_response([], 0, 0)
 
-            if not createdDateFrom and not createdDateTo and not q:
-                # Handle the case when no specific filters are provided
-                location_data = request.env['stock.location'].sudo().search([])
-                total_records = len(location_data)
-            else:
-                if createdDateFrom or createdDateTo:
-                    created_date_from = fields.Date.from_string(createdDateFrom) if createdDateFrom else fields.Date.today()
-                    created_date_to = fields.Date.from_string(createdDateTo) if createdDateTo else fields.Date.today()
+            if createdDateFrom or createdDateTo:
+                created_date_from = fields.Date.from_string(createdDateFrom) if createdDateFrom else fields.Date.today()
+                created_date_to = fields.Date.from_string(createdDateTo) if createdDateTo else fields.Date.today()
 
-                    domain += [('create_date', '>=', created_date_from.strftime(date_format)),
+                domain += [('create_date', '>=', created_date_from.strftime(date_format)),
                           ('create_date', '<=', created_date_to.strftime(date_format))]
 
-                pageSize = int(pageSize) if pageSize else 200
-
-            if not q:  # Check if q is provided
-                location_data, total_records = paginate_records('stock.location', domain, pageSize, page)
-            else:
-                location_data = request.env['stock.location'].sudo().search(domain)
-                total_records = len(location_data)
+            # ✅ Fetch data with pagination - ALWAYS use domain
+            location_data, total_records = paginate_records('stock.location', domain, pageSize, page)
 
             data_master_location = []
             jakarta_tz = pytz.timezone('Asia/Jakarta')
+            
             for location in location_data:
                 create_date_utc = location.create_date
                 create_date_jakarta = pytz.utc.localize(create_date_utc).astimezone(jakarta_tz)
+                
                 locations_data = {
                     'id': location.id,
                     'name': location.complete_name,
                     'create_date': str(create_date_jakarta),
-                    'location_id': location.location_id.id,
-                    'location': location.location_id.name,
+                    'location_id': location.location_id.id if location.location_id else None,
+                    'location': location.location_id.name if location.location_id else "",
                     'usage': location.usage,
                     'scrap_location': location.scrap_location,
                     'return_location': location.return_location,
                     'replenish_location': location.replenish_location,
-                    'last_inventory_date': str(location.last_inventory_date),
-                    'next_inventory_date': str(location.next_inventory_date),
-                    'company_id': location.company_id.id,
-                    'company_name': location.company_id.name
-                    
+                    'last_inventory_date': str(location.last_inventory_date) if location.last_inventory_date else "",
+                    'next_inventory_date': str(location.next_inventory_date) if location.next_inventory_date else "",
+                    'company_id': location.company_id.id if location.company_id else None,
+                    'company_name': location.company_id.name if location.company_id else ""
                 }
                 data_master_location.append(locations_data)
-
-            if not createdDateFrom and not createdDateTo and not q:
-                total_records = len(data_master_location)
 
             total_pages = (total_records + pageSize - 1) // pageSize
 
             return serialize_response(data_master_location, total_records, total_pages)
         
         except ValidationError as ve:
-            # If any required parameter is missing, return HTTP 500 error
             error_response = {
                 'error': 'One or more required parameters are missing.',
                 'status': 500
@@ -2399,7 +2557,19 @@ class InvoiceOrder(http.Controller):
 
             for order in invoice_accounting:
                 try:
-                    order_pos = request.env['pos.order'].sudo().search([('vit_trxid', '=', order.ref), ('state', '=', 'invoiced')], limit=1)
+                    # Check apakah invoice ini memiliki produk dengan gm_is_dp = True
+                    has_dp_product = False
+                    for line in order.invoice_line_ids:
+                        if line.product_id and hasattr(line.product_id, 'gm_is_dp') and line.product_id.gm_is_dp:
+                            has_dp_product = True
+                            break
+                    
+                    # Skip invoice yang memiliki produk DP
+                    if has_dp_product:
+                        _logger.info(f"Skipping invoice {order.name} - contains DP product")
+                        continue
+
+                    order_pos = request.env['pos.order'].sudo().search([('state', '=', 'invoiced')], limit=1)
                     location_id = location = location_dest_id = location_dest = None
 
                     if order_pos:
@@ -2440,7 +2610,8 @@ class InvoiceOrder(http.Controller):
                     _logger.warning(f"Error processing invoice {order.id}: {str(line_error)}")
                     continue
 
-            total_records = int(total_records)
+            # Hitung ulang total_records karena ada filter DP
+            total_records = len(data_invoice_accounting)
             total_pages = (total_records + pageSize - 1) // pageSize
 
             return serialize_response(data_invoice_accounting, total_records, total_pages)
@@ -2469,6 +2640,21 @@ class InvoiceOrder(http.Controller):
                     response=json.dumps({'status': 404, 'message': 'Invoice Order not found'})
                 )
 
+            # Check apakah invoice ini memiliki produk dengan gm_is_dp = True
+            has_dp_product = False
+            for line in invoicing.invoice_line_ids:
+                if line.product_id and hasattr(line.product_id, 'gm_is_dp') and line.product_id.gm_is_dp:
+                    has_dp_product = True
+                    break
+            
+            # Return 404 jika invoice memiliki produk DP
+            if has_dp_product:
+                return werkzeug.wrappers.Response(
+                    status=404,
+                    content_type='application/json; charset=utf-8',
+                    response=json.dumps({'status': 404, 'message': 'Invoice contains DP product and cannot be displayed'})
+                )
+
             invoice_lines = invoicing.invoice_line_ids
             partner = invoicing.partner_id
             company = invoicing.company_id
@@ -2492,6 +2678,15 @@ class InvoiceOrder(http.Controller):
                     # Skip line yang bukan produk (tidak ada product_id)
                     if not line.product_id:
                         _logger.info(f"Skipping line {line.id} - no product_id")
+                        continue
+
+                    if line.product_id.default_code == 'DPPOS':
+                        _logger.info(f"Skipping line {line.id} - product code is ITEMDP")
+                        continue
+                    
+                    # Skip line dengan produk DP (double check)
+                    if hasattr(line.product_id, 'gm_is_dp') and line.product_id.gm_is_dp:
+                        _logger.info(f"Skipping line {line.id} - is DP product")
                         continue
                     
                     # Skip hanya jika quantity 0
@@ -2889,7 +3084,11 @@ class CrediNoteAPI(http.Controller):
             location = None
 
             for order in invoice_accounting:
-                order_pos = request.env['pos.order'].sudo().search([('vit_trxid', '=', order.ref), ('state', '=', 'invoiced')], limit=1)
+                # Cari pos.order dari relasi langsung
+                order_pos = order.pos_order_ids.filtered(lambda p: p.state == 'invoiced')
+                if not order_pos and order.ref:
+                    # Fallback: cari berdasarkan name yang match dengan ref
+                    order_pos = request.env['pos.order'].sudo().search([('name', '=', order.ref), ('state', '=', 'invoiced')], limit=1)
                 
                 if not order_pos:  # Skip if no related pos.order is found
                     continue
@@ -4010,7 +4209,11 @@ class TsOutAPI(http.Controller):
                 return serialize_response([], 0, 0)
 
             date_format = '%Y-%m-%d'
-            domain = [('picking_type_id.name', '=', 'TS Out'), ('state', '=', 'done')]  # Initialize domain here
+            # Updated domain to filter by Internal Transfers and gm_type_transfer
+            domain = [
+                ('picking_type_id.name', '=', 'TSOUT'),
+                ('state', '=', 'done')
+            ]
 
             if q:
                 domain += [('name', 'ilike', str(q))]
@@ -4024,7 +4227,6 @@ class TsOutAPI(http.Controller):
 
             if not createdDateFrom and not createdDateTo and not q and is_integrated is None:
                 # Handle the case when no specific filters are provided
-                # domain = [('name', 'ilike', str(q))] if q else [('state', '=', 'done'), ('picking_type_id.name', '=', 'TS Out')]
                 transit_out = request.env['stock.picking'].sudo().search(domain)
                 total_records = len(transit_out)
             else:
@@ -4032,9 +4234,10 @@ class TsOutAPI(http.Controller):
                     created_date_from = fields.Date.from_string(createdDateFrom) if createdDateFrom else fields.Date.today()
                     created_date_to = fields.Date.from_string(createdDateTo) if createdDateTo else fields.Date.today()
 
-                    domain += [('create_date', '>=', created_date_from.strftime(date_format)),
-                          ('create_date', '<=', created_date_to.strftime(date_format)),
-                          ('picking_type_id.name', '=', 'TS Out'), ('state', '=', 'done')]
+                    domain += [
+                        ('create_date', '>=', created_date_from.strftime(date_format)),
+                        ('create_date', '<=', created_date_to.strftime(date_format))
+                    ]
                     
                 if is_integrated is not None:
                     is_integrated_bool = str(is_integrated).lower() == 'true'
@@ -4065,6 +4268,7 @@ class TsOutAPI(http.Controller):
                     'location_dest': order.location_dest_id.complete_name,
                     'picking_type_id': order.picking_type_id.id,
                     'picking_type': order.picking_type_id.name,
+                    'gm_type_transfer': order.gm_type_transfer,  # Added field
                     'create_date': str(create_date_jakarta),
                     'scheduled_date': str(order.scheduled_date),
                     'date_done': str(order.date_done),
@@ -4101,9 +4305,9 @@ class TsOutAPI(http.Controller):
             if not transit_out:
                 raise werkzeug.exceptions.NotFound(_("Transfer Out"))
             
-            # Ensure the order is a 'Return' type
-            if transit_out.picking_type_id.name != 'TS Out':
-                raise werkzeug.exceptions.NotFound(_("Transfer is not in TS Out"))
+            # Updated validation to check gm_type_transfer instead of picking_type_id.name
+            if transit_out.gm_type_transfer != 'ts_out':
+                raise werkzeug.exceptions.NotFound(_("Transfer is not TS Out"))
 
             transit_out_lines = transit_out.move_ids_without_package
             doc_num = transit_out.name
@@ -4156,6 +4360,7 @@ class TsOutAPI(http.Controller):
                 'location_dest': location_dest,
                 'picking_type_id': picking_type_id,
                 'picking_type': picking_type,
+                'gm_type_transfer': transit_out.gm_type_transfer,  # Added field
                 'created_date': created_date,
                 'scheduled_date': scheduled_date,
                 'date_done': date_done,
@@ -4183,7 +4388,11 @@ class TsInAPI(http.Controller):
                 return serialize_response([], 0, 0)
 
             date_format = '%Y-%m-%d'
-            domain = [('picking_type_id.name', '=', 'TS In'), ('state', '=', 'done')]  # Initialize domain here
+            # Updated domain to filter by Internal Transfers and gm_type_transfer
+            domain = [
+                ('picking_type_id.name', '=', 'TSIN'),
+                ('state', '=', 'done')
+            ]
 
             if q:
                 domain += [('name', 'ilike', str(q))]
@@ -4203,9 +4412,10 @@ class TsInAPI(http.Controller):
                     created_date_from = fields.Date.from_string(createdDateFrom) if createdDateFrom else fields.Date.today()
                     created_date_to = fields.Date.from_string(createdDateTo) if createdDateTo else fields.Date.today()
 
-                    domain += [('create_date', '>=', created_date_from.strftime(date_format)),
-                          ('create_date', '<=', created_date_to.strftime(date_format)),
-                          ('picking_type_id.name', '=', 'TS In'), ('state', '=', 'done')]
+                    domain += [
+                        ('create_date', '>=', created_date_from.strftime(date_format)),
+                        ('create_date', '<=', created_date_to.strftime(date_format))
+                    ]
 
                 if is_integrated is not None:
                     is_integrated_bool = str(is_integrated).lower() == 'true'
@@ -4236,6 +4446,7 @@ class TsInAPI(http.Controller):
                     'location_dest': order.location_dest_id.complete_name,
                     'picking_type_id': order.picking_type_id.id,
                     'picking_type': order.picking_type_id.name,
+                    'gm_type_transfer': order.gm_type_transfer,  # Added field
                     'create_date': str(create_date_jakarta),
                     'scheduled_date': str(order.scheduled_date),
                     'date_done': str(order.date_done),
@@ -4272,9 +4483,9 @@ class TsInAPI(http.Controller):
             if not transit_in:
                 raise werkzeug.exceptions.NotFound(_("TS In not found"))
             
-            # Ensure the order is a 'Return' type
-            if transit_in.picking_type_id.name != 'TS In':
-                raise werkzeug.exceptions.NotFound(_("Transfer Is Not In TS In"))
+            # Updated validation to check gm_type_transfer instead of picking_type_id.name
+            if transit_in.gm_type_transfer != 'ts_in':
+                raise werkzeug.exceptions.NotFound(_("Transfer Is Not TS In"))
 
             transit_in_lines = transit_in.move_ids_without_package
             doc_num = transit_in.name
@@ -4327,6 +4538,7 @@ class TsInAPI(http.Controller):
                 'location_dest': location_dest,
                 'picking_type_id': picking_type_id,
                 'picking_type': picking_type,
+                'gm_type_transfer': transit_in.gm_type_transfer,  # Added field
                 'created_date': created_date,
                 'scheduled_date': scheduled_date,
                 'date_done': date_done,
