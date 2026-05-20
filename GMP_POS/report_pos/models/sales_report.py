@@ -94,7 +94,7 @@ class SalesReportDetail(models.TransientModel):
         worksheet.write(2, 0, "Dicetak Tanggal {}".format(tanggal_cetak))
 
         header = [
-            'User', 'Kasir', 'Customer Code', 'Customer Name', 'Kode Currency', 'Kode Store','Nama Store',
+            'User', 'Kasir', 'Salesperson', 'Customer Code', 'Customer Name', 'Kode Currency', 'Kode Store','Nama Store',
             'Invoice No.', 'Order No.', 'Session', 'No Retur', 'No HP', 'Tanggal', 'Tanggal Jatuh Tempo',
             'Sub Divisi', 'Item Kelas', 'Item Tipe',
             'Item Code', 'Nama Item', 'POS Category', 'Satuan', 'Quantity',
@@ -110,33 +110,34 @@ class SalesReportDetail(models.TransientModel):
             for order_line in order.lines:
                 worksheet.write(row, 0, order.user_id.name or '')
                 worksheet.write(row, 1, order.employee_id.name or '')
-                worksheet.write(row, 2, order.partner_id.customer_code or '')
-                worksheet.write(row, 3, order.partner_id.name or '')
-                worksheet.write(row, 4, order.currency_id.name or '')
-                worksheet.write(row, 5, order.config_id.name or '')
+                worksheet.write(row, 2, order_line.user_id.name or '')
+                worksheet.write(row, 3, order.partner_id.customer_code or '')
+                worksheet.write(row, 4, order.partner_id.name or '')
+                worksheet.write(row, 5, order.currency_id.name or '')
                 worksheet.write(row, 6, order.config_id.name or '')
-                worksheet.write(row, 7, order.account_move.name or '')
-                worksheet.write(row, 8, order.name or '')
-                worksheet.write(row, 9, order.session_id.name or '')
-                worksheet.write(row, 10, order.name if 'REFUND' in order.name.upper() else '')
-                worksheet.write(row, 11, order.partner_id.mobile or '')
-                worksheet.write(row, 12, local_date_order.strftime('%d/%m/%Y %H:%M:%S'))
+                worksheet.write(row, 7, order.config_id.name or '')
+                worksheet.write(row, 8, order.account_move.name or '')
+                worksheet.write(row, 9, order.name or '')
+                worksheet.write(row, 10, order.session_id.name or '')
+                worksheet.write(row, 11, order.name if 'REFUND' in order.name.upper() else '')
+                worksheet.write(row, 12, order.partner_id.mobile or '')
                 worksheet.write(row, 13, local_date_order.strftime('%d/%m/%Y %H:%M:%S'))
+                worksheet.write(row, 14, local_date_order.strftime('%d/%m/%Y %H:%M:%S'))
                 
-                worksheet.write(row, 14, order_line.product_id.vit_sub_div or '')
-                worksheet.write(row, 15, order_line.product_id.vit_item_kel or '')
-                worksheet.write(row, 16, order_line.product_id.vit_item_type or '')
+                worksheet.write(row, 15, order_line.product_id.vit_sub_div or '')
+                worksheet.write(row, 16, order_line.product_id.vit_item_kel or '')
+                worksheet.write(row, 17, order_line.product_id.vit_item_type or '')
 
-                worksheet.write(row, 17, order_line.product_id.default_code or '')
-                worksheet.write(row, 18, order_line.product_id.name or '')
-                worksheet.write(row, 19, order_line.product_id.product_tmpl_id.pos_categ_ids[0].name if order_line.product_id.product_tmpl_id.pos_categ_ids else '')
-                worksheet.write(row, 20, order_line.product_uom_id.name or '')
-                worksheet.write(row, 21, order_line.qty)
-                worksheet.write(row, 22, self.format_number(order_line.price_unit) if order_line.price_unit else '')
-                worksheet.write(row, 23, order_line.discount or 0)
-                worksheet.write(row, 24, ", ".join(order_line.tax_ids_after_fiscal_position.mapped('name')) or '')
-                worksheet.write(row, 25, self.format_number(order_line.price_subtotal) if order_line.price_subtotal else '')
-                worksheet.write(row, 26, self.format_number(order_line.price_subtotal_incl) if order_line.price_subtotal_incl else '')
+                worksheet.write(row, 18, order_line.product_id.default_code or '')
+                worksheet.write(row, 19, order_line.product_id.name or '')
+                worksheet.write(row, 20, order_line.product_id.product_tmpl_id.pos_categ_ids[0].name if order_line.product_id.product_tmpl_id.pos_categ_ids else '')
+                worksheet.write(row, 21, order_line.product_uom_id.name or '')
+                worksheet.write(row, 22, order_line.qty)
+                worksheet.write(row, 23, self.format_number(order_line.price_unit) if order_line.price_unit else '')
+                worksheet.write(row, 24, order_line.discount or 0)
+                worksheet.write(row, 25, ", ".join(order_line.tax_ids_after_fiscal_position.mapped('name')) or '')
+                worksheet.write(row, 26, self.format_number(order_line.price_subtotal) if order_line.price_subtotal else '')
+                worksheet.write(row, 27, self.format_number(order_line.price_subtotal_incl) if order_line.price_subtotal_incl else '')
                 row += 1
 
         workbook.close()
@@ -632,7 +633,11 @@ class SalesReportDetail(models.TransientModel):
         }
 
     def format_number(self, number):
-        return f"{number:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        # Pemisah ribuan pakai koma (,), desimal pakai titik (.).
+        # Tidak ada pembulatan ke bilangan bulat — nilai asli ditampilkan
+        # apa adanya dengan 2 angka di belakang koma.
+        value = float(number or 0)
+        return f"{value:,.2f}"
     
     def get_header_format(self, workbook):
         return workbook.add_format({
@@ -1134,7 +1139,7 @@ class SalesReportDetail(models.TransientModel):
         worksheet.write(2, 0, "Dicetak Tanggal {}".format(tanggal_cetak))
 
         header = [
-            'User', 'Kasir', 'Invoice No.', 'Order No.', 'Session', 'Tanggal', 'Kode Store', 'Nama Store',
+            'User', 'Kasir', 'Salesperson', 'Customer', 'Invoice No.', 'Order No.', 'Session', 'Tanggal', 'Kode Store', 'Nama Store',
             'Payment Method', 'Nominal', 'Tanggal Payment'
         ]
 
@@ -1144,18 +1149,21 @@ class SalesReportDetail(models.TransientModel):
         row = 5
         for order in orders:
             local_date_order = fields.Datetime.context_timestamp(self, order.date_order)
+            salesperson_names = ", ".join(sorted(set(filter(None, order.lines.mapped('user_id.name')))))
             for order_line in order.payment_ids:
                 worksheet.write(row, 0, order.user_id.name or '')
                 worksheet.write(row, 1, order.employee_id.name or '')
-                worksheet.write(row, 2, order.account_move.name or '')
-                worksheet.write(row, 3, order.name or '')
-                worksheet.write(row, 4, order.session_id.name or '')
-                worksheet.write(row, 5, local_date_order.strftime('%d/%m/%Y %H:%M:%S'))
-                worksheet.write(row, 6, order.config_id.name or '')
-                worksheet.write(row, 7, order.config_id.name or '')
-                worksheet.write(row, 8, order_line.payment_method_id.name or '')
-                worksheet.write(row, 9, self.format_number(order_line.amount) if order_line.amount else '')
-                worksheet.write(row, 10, order_line.payment_date.strftime('%Y-%m-%d %H:%M:%S') if order_line.payment_date else '')
+                worksheet.write(row, 2, salesperson_names)
+                worksheet.write(row, 3, order.partner_id.name or '')
+                worksheet.write(row, 4, order.account_move.name or '')
+                worksheet.write(row, 5, order.name or '')
+                worksheet.write(row, 6, order.session_id.name or '')
+                worksheet.write(row, 7, local_date_order.strftime('%d/%m/%Y %H:%M:%S'))
+                worksheet.write(row, 8, order.config_id.name or '')
+                worksheet.write(row, 9, order.config_id.name or '')
+                worksheet.write(row, 10, order_line.payment_method_id.name or '')
+                worksheet.write(row, 11, self.format_number(order_line.amount) if order_line.amount else '')
+                worksheet.write(row, 12, order_line.payment_date.strftime('%Y-%m-%d %H:%M:%S') if order_line.payment_date else '')
                 row += 1
 
         workbook.close()

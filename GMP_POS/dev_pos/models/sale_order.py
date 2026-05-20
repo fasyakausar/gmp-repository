@@ -1,5 +1,8 @@
 from odoo import api, fields, models, _
 from odoo.exceptions import UserError
+from odoo.tools import float_round
+import copy
+import math
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -87,16 +90,215 @@ class SaleOrder(models.Model):
         compute='_compute_is_cashier',
     )
 
+    # DUMMY FIELD untuk menghindari error jika modul mrp tidak terinstal
+    mrp_production_count = fields.Integer(
+        string='Manufacturing Orders',
+        compute='_compute_mrp_production_count_safe',
+        store=False,
+    )
+    amount_total_rounded = fields.Float(
+        compute='_compute_amount_total_rounded',
+        string='Total (Rounded)',
+        digits='Account',
+        store=False,
+        help="Total pesanan dibulatkan ke integer dengan aturan half-up "
+             "(<,50 turun ; >=,50 naik)."
+    )
+ 
+    # Precision default untuk report: 0 = dibulatkan ke bilangan bulat rupiah.
+    # Ganti ke angka lain (mis. 2) jika suatu saat perlu tampilkan desimal.
+    _ROUNDING_REPORT_PRECISION = 0
+ 
+    def _round_half_up(self, value, precision=None):
+        """Bulatkan half-up: desimal < 0,50 turun, >= 0,50 naik.
+ 
+        - precision=None -> pakai _ROUNDING_REPORT_PRECISION (default 0,
+                             yaitu dibulatkan ke bilangan bulat rupiah).
+        - precision=N     -> bulatkan ke N angka di belakang koma.
+ 
+        Tidak menyentuh field asli — dipakai khusus untuk tampilan cetak
+        atau field turunan (compute, store=False).
+        """
+        self.ensure_one()
+        if precision is None:
+            precision = self._ROUNDING_REPORT_PRECISION
+        factor = 10 ** precision
+        value = value or 0.0
+        if value >= 0:
+            return math.floor(value * factor + 0.5) / factor
+        return -math.floor(-value * factor + 0.5) / factor
+ 
+    @api.depends('amount_total')
+    def _compute_amount_total_rounded(self):
+        for order in self:
+            order.amount_total_rounded = order._round_half_up(order.amount_total)
+ 
+    def _get_rounded_tax_totals(self):
+        """Salinan self.tax_totals dengan nilai mentah DAN string
+        formatted_*-nya dibulatkan/diregenerasi half-up ke bilangan bulat
+        rupiah, khusus untuk report (tidak mengubah field asli).
+ 
+        Struktur berikut sudah TERKONFIRMASI dari template QWeb asli
+        (account.document_tax_totals_template & account.tax_groups_totals):
+ 
+            tax_totals = {
+                'subtotals': [
+                    {'name': ..., 'amount': ..., 'formatted_amount': ...},
+                ],
+                'groups_by_subtotal': {
+                    <subtotal_name>: [
+                        {'tax_group_name': ...,
+                         'tax_group_amount': ..., 'formatted_tax_group_amount': ...,
+                         'tax_group_base_amount': ..., 'formatted_tax_group_base_amount': ...,
+                         'hide_base_amount': ...},
+                    ],
+                },
+                'amount_total': ...,
+                'formatted_amount_total': ...,
+                'rounding_amount': ... ,           # hanya ada jika Cash Rounding aktif
+                'formatted_rounding_amount': ...,   # hanya ada jika Cash Rounding aktif
+            }
+ 
+        PENTING: template merender string 'formatted_*', bukan angka mentah.
+        Jadi setiap angka mentah yang dibulatkan HARUS diikuti regenerasi
+        string 'formatted_*'-nya, kalau tidak angka di PDF tidak berubah.
+        """
+        self.ensure_one()
+        totals = copy.deepcopy(self.tax_totals or {})
+        currency = self.currency_id
+ 
+        def r(v):
+            return self._round_half_up(v)
+ 
+        def fmt(v):
+            return currency.format(v) if currency else v
+ 
+        # -- Total keseluruhan --
+        if 'amount_total' in totals:
+            totals['amount_total'] = r(totals['amount_total'])
+            if 'formatted_amount_total' in totals:
+                totals['formatted_amount_total'] = fmt(totals['amount_total'])
+ 
+        # -- Baris "Rounding" bawaan Odoo (hanya ada jika Cash Rounding aktif) --
+        if 'rounding_amount' in totals:
+            totals['rounding_amount'] = r(totals['rounding_amount'])
+            if 'formatted_rounding_amount' in totals:
+                totals['formatted_rounding_amount'] = fmt(totals['rounding_amount'])
+ 
+        # -- Subtotal (mis. "Untaxed Amount") --
+        for subtotal in totals.get('subtotals', []):
+            if 'amount' in subtotal:
+                subtotal['amount'] = r(subtotal['amount'])
+                if 'formatted_amount' in subtotal:
+                    subtotal['formatted_amount'] = fmt(subtotal['amount'])
+ 
+        # -- Rincian pajak per grup, per subtotal --
+        for group_list in totals.get('groups_by_subtotal', {}).values():
+            for group in group_list:
+                if 'tax_group_amount' in group:
+                    group['tax_group_amount'] = r(group['tax_group_amount'])
+                    if 'formatted_tax_group_amount' in group:
+                        group['formatted_tax_group_amount'] = fmt(group['tax_group_amount'])
+                if 'tax_group_base_amount' in group:
+                    group['tax_group_base_amount'] = r(group['tax_group_base_amount'])
+                    if 'formatted_tax_group_base_amount' in group:
+                        group['formatted_tax_group_base_amount'] = fmt(group['tax_group_base_amount'])
+ 
+        return totals
+
+    # ── helper untuk mencari pos.config berdasarkan warehouse (dengan sudo) ──
+    def _get_pos_config_by_warehouse(self, warehouse=None):
+        """
+        Mencari pos.config yang terhubung dengan warehouse tertentu.
+        Menggunakan sudo() agar user non-admin bisa membaca pos.config.
+        Urutan pencarian:
+        1. Berdasarkan warehouse_id eksak.
+        2. Berdasarkan nama/kode warehouse dari pos_config.warehouse_id.
+        3. Berdasarkan nama pos_config yang cocok dengan code/nama warehouse.
+        4. Berdasarkan operation type (picking_type_id.name).
+        Returns: pos.config record atau False.
+        """
+        if not warehouse and self.warehouse_id:
+            warehouse = self.warehouse_id
+        if not warehouse:
+            return False
+
+        PosConfig = self.env['pos.config'].sudo()
+
+        # 1. Cari berdasarkan warehouse_id eksak
+        pos_config = PosConfig.search([
+            ('warehouse_id', '=', warehouse.id),
+            ('company_id', '=', self.company_id.id),
+            ('active', '=', True),
+        ], limit=1)
+        if pos_config:
+            return pos_config
+
+        wh_name = (warehouse.name or '').strip().lower()
+        wh_code = (warehouse.code or '').strip().lower()
+
+        # 2. Cari berdasarkan nama/kode warehouse dari pos_config.warehouse_id
+        all_configs = PosConfig.search([
+            ('company_id', '=', self.company_id.id),
+            ('active', '=', True),
+        ])
+        for pc in all_configs:
+            wh = pc.warehouse_id
+            if wh:
+                pc_wh_name = (wh.name or '').strip().lower()
+                pc_wh_code = (wh.code or '').strip().lower()
+                if pc_wh_name == wh_name or pc_wh_code == wh_code:
+                    _logger.warning(
+                        "Fallback (by warehouse name/code): warehouse '%s' (id=%d) menggunakan pos.config '%s' (warehouse_id=%d)",
+                        warehouse.name, warehouse.id, pc.name, pc.warehouse_id.id
+                    )
+                    return pc
+
+        # 3. Cari berdasarkan nama pos_config yang cocok dengan code warehouse atau nama warehouse
+        for pc in all_configs:
+            pc_name = (pc.name or '').strip().lower()
+            if pc_name == wh_code or pc_name == wh_name or (wh_code and pc_name == wh_code) or (wh_name and wh_name in pc_name):
+                _logger.warning(
+                    "Fallback (by pos_config name): warehouse '%s' (id=%d) menggunakan pos.config '%s' (warehouse_id=%d)",
+                    warehouse.name, warehouse.id, pc.name, pc.warehouse_id.id
+                )
+                return pc
+
+        # 4. Cari berdasarkan operation type (picking_type_id) yang namanya cocok dengan warehouse code/name
+        for pc in all_configs:
+            picking_type = pc.picking_type_id
+            if picking_type:
+                pt_name = (picking_type.name or '').strip().lower()
+                if (wh_code and wh_code in pt_name) or (wh_name and wh_name in pt_name):
+                    _logger.warning(
+                        "Fallback (by picking type): warehouse '%s' (id=%d) menggunakan pos.config '%s' via picking type '%s'",
+                        warehouse.name, warehouse.id, pc.name, picking_type.name
+                    )
+                    return pc
+
+        _logger.warning("Tidak ada pos.config untuk warehouse '%s' (id=%d)", warehouse.name, warehouse.id)
+        return False
+
     @api.depends_context('uid')
     def _compute_is_cashier(self):
         is_cashier = self.env.user.has_group('dev_pos.group_sale_cashier')
         for order in self:
             order.is_cashier = is_cashier
 
-    # ── helper ────────────────────────────────────────────
+    def _compute_mrp_production_count_safe(self):
+        """Set nilai 0 jika modul mrp tidak aktif, atau biarkan method asli jika ada."""
+        if hasattr(super(SaleOrder, self), '_compute_mrp_production_count'):
+            try:
+                super(SaleOrder, self)._compute_mrp_production_count()
+            except Exception:
+                for order in self:
+                    order.mrp_production_count = 0
+        else:
+            for order in self:
+                order.mrp_production_count = 0
 
+    # ── helper mapping tax ────────────────────────────────
     def _get_mapping_tax_for_warehouse(self, warehouse):
-        """Kembalikan mapping.tax record untuk warehouse, atau False."""
         if not warehouse:
             return False
         return self.env['mapping.tax'].search([
@@ -111,70 +313,25 @@ class SaleOrder(models.Model):
         if not mapping:
             return None, False, ''
 
-        bp_tax = partner.gm_bp_tax
-
-        # ── BARU: jika bp_tax kosong, tentukan mapping_tax dari amount 0 sebagai default ──
-        if not bp_tax:
-            # Gunakan gm_tax_code (normal) sebagai default jika bp_tax tidak diisi
-            mapping_tax = mapping.gm_tax_code
-            if not mapping_tax:
-                return None, False, ''
-            return True, mapping_tax, ''
-
-        # ── bp_tax ada: tentukan mapping_tax sesuai rate ──
-        if bp_tax.amount == 0:
-            mapping_tax = mapping.gm_tax_code_0
-            label = 'Tax 0% (gm_tax_code_0)'
-        else:
-            mapping_tax = mapping.gm_tax_code
-            label = 'Tax normal (gm_tax_code)'
-
+        mapping_tax = mapping.gm_tax_code
         if not mapping_tax:
             return None, False, ''
-
-        if bp_tax.id != mapping_tax.id:
-            message = _(
-                "BP Tax partner tidak sesuai mapping warehouse!\n\n"
-                "Partner     : %s\n"
-                "BP Tax      : %s\n"
-                "Warehouse   : %s\n"
-                "Tax Mapping : %s (%s)\n\n"
-                "Gunakan partner dengan BP Tax '%s' "
-                "atau pilih warehouse yang sesuai."
-            ) % (
-                partner.name,
-                bp_tax.name,
-                warehouse.name,
-                mapping_tax.name,
-                label,
-                mapping_tax.name,
-            )
-            return False, mapping_tax, message
 
         return True, mapping_tax, ''
 
     # ── validasi untuk create/write ───────────────────────
-
     def _check_line_tax_vs_mapping(self, partner_id, warehouse_id, order_lines_vals):
-        """
-        Safety net di create() dan write().
-        Blokir jika bp_tax partner tidak sesuai mapping WH,
-        atau jika tax di order line tidak sesuai mapping.
-        """
         partner = self.env['res.partner'].browse(partner_id) if partner_id else False
         warehouse = self.env['stock.warehouse'].browse(warehouse_id) if warehouse_id else False
 
         valid, mapping_tax, message = self._validate_bp_tax_vs_mapping(partner, warehouse)
 
-        # Tidak cocok → hard block
         if valid is False:
             raise UserError(message)
 
-        # Tidak ada mapping/bp_tax → lewati
         if valid is None:
             return
 
-        # Cocok → cek tax di setiap order line harus sama dengan mapping_tax
         for cmd in (order_lines_vals or []):
             if cmd[0] not in (0, 1):
                 continue
@@ -208,37 +365,27 @@ class SaleOrder(models.Model):
                 ))
 
     # ── pricelist dari partner ────────────────────────────
-
     def _get_partner_pricelist(self, partner):
-        """Ambil pricelist dari partner (field property_product_pricelist)"""
         if partner:
             return partner.property_product_pricelist
         return False
 
     # ── onchange ──────────────────────────────────────────
-
     @api.onchange('partner_id')
     def _onchange_partner_customer_info(self):
         self.customer_info = self.partner_id.company_id if self.partner_id else False
 
     @api.onchange('partner_id')
     def _onchange_partner_pricelist(self):
-        """Saat partner berubah, set pricelist dari partner (hanya jika belum diubah manual)"""
         if self.partner_id:
             pricelist = self._get_partner_pricelist(self.partner_id)
             if pricelist:
                 self.pricelist_id = pricelist
             else:
-                # Fallback ke pricelist default perusahaan
                 self.pricelist_id = self.env.company.default_pricelist_id
 
     @api.onchange('partner_id', 'warehouse_id')
     def _onchange_apply_mapping_tax(self):
-        """
-        Validasi bp_tax partner vs mapping tax warehouse.
-        - Tidak cocok → warning (tidak update line, tidak block save di onchange)
-        - Cocok       → apply tax ke semua order line yang berbeda
-        """
         if not self.partner_id or not self.warehouse_id:
             return
 
@@ -246,18 +393,15 @@ class SaleOrder(models.Model):
             self.partner_id, self.warehouse_id
         )
 
-        # Tidak cocok → tampilkan warning, jangan ubah apapun
         if valid is False:
             return {'warning': {
                 'title': _('Tax Partner Tidak Sesuai Mapping Warehouse'),
                 'message': message,
             }}
 
-        # Tidak ada mapping/bp_tax → lewati
         if valid is None:
             return
 
-        # Cocok → apply tax ke semua order line yang taxnya berbeda
         updated_lines = []
         for line in self.order_line:
             if line.tax_id.ids != [mapping_tax.id]:
@@ -281,7 +425,6 @@ class SaleOrder(models.Model):
 
     @api.onchange('pricelist_id')
     def _onchange_pricelist_id_check_cashier(self):
-        """Kasir: jika mencoba ubah pricelist, kembalikan ke nilai lama dan beri warning"""
         if self.env.user.has_group('dev_pos.group_sale_cashier') and self.pricelist_id:
             if self._origin and self._origin.pricelist_id != self.pricelist_id:
                 return {
@@ -293,7 +436,6 @@ class SaleOrder(models.Model):
                 }
 
     # ── compute & crud ────────────────────────────────────
-
     @api.depends('user_id', 'company_id')
     def _compute_warehouse_id(self):
         allowed_all = self.env.user.sudo().allowed_warehouse_ids
@@ -314,7 +456,6 @@ class SaleOrder(models.Model):
     @api.model
     def default_get(self, fields_list):
         res = super().default_get(fields_list)
-        # Set pricelist dari partner jika ada default_partner_id di context
         if 'pricelist_id' in fields_list:
             partner_id = self.env.context.get('default_partner_id')
             if partner_id:
@@ -322,7 +463,6 @@ class SaleOrder(models.Model):
                 pricelist = self._get_partner_pricelist(partner)
                 if pricelist:
                     res['pricelist_id'] = pricelist.id
-        # Set warehouse dari allowed user
         allowed = self.env.user.sudo().allowed_warehouse_ids.filtered(
             lambda w: w.company_id.id == self.env.company.id
         )
@@ -380,20 +520,15 @@ class SaleOrder(models.Model):
                 expected_pricelist = self._get_partner_pricelist(partner)
 
                 if user_is_cashier:
-                    # Kasir tidak boleh menentukan pricelist sendiri
                     if 'pricelist_id' in vals:
                         if expected_pricelist and vals['pricelist_id'] != expected_pricelist.id:
                             raise UserError(_("Anda tidak diizinkan memilih Pricelist. Pricelist akan otomatis dari customer."))
-                        # Jika sama, biarkan saja (boleh)
-                    # Jika belum ada pricelist di vals, set dari partner
                     if expected_pricelist and 'pricelist_id' not in vals:
                         vals['pricelist_id'] = expected_pricelist.id
                 else:
-                    # Non-kasir: jika pricelist tidak disediakan, set dari partner (opsional)
                     if expected_pricelist and 'pricelist_id' not in vals:
                         vals['pricelist_id'] = expected_pricelist.id
 
-            # Validasi warehouse allowed
             allowed = self.env.user.sudo().allowed_warehouse_ids.filtered(
                 lambda w: w.company_id.id == self.env.company.id
             )
@@ -406,7 +541,6 @@ class SaleOrder(models.Model):
                         "Silakan pilih warehouse yang diizinkan untuk akun Anda."
                     ))
 
-            # Validasi line tax vs mapping
             self._check_line_tax_vs_mapping(
                 partner_id=vals.get('partner_id'),
                 warehouse_id=vals.get('warehouse_id'),
@@ -462,12 +596,34 @@ class SaleOrder(models.Model):
 class SaleOrderLine(models.Model):
     _inherit = 'sale.order.line'
 
+    price_subtotal_rounded = fields.Monetary(
+        string='Subtotal (Rounded)',
+        compute='_compute_price_subtotal_rounded',
+        currency_field='currency_id',
+        store=False,
+        help="Subtotal baris order yang dibulatkan half-up "
+             "(<,50 turun ; >=,50 naik), khusus untuk tampilan cetak."
+    )
+ 
+    @api.depends('price_subtotal', 'currency_id', 'order_id')
+    def _compute_price_subtotal_rounded(self):
+        for line in self:
+            order = line.order_id
+            if order:
+                line.price_subtotal_rounded = order._round_half_up(line.price_subtotal)
+            else:
+                # fallback jika line belum terhubung ke order (jarang terjadi)
+                precision = line.currency_id.decimal_places if line.currency_id else 2
+                factor = 10 ** precision
+                value = line.price_subtotal or 0.0
+                line.price_subtotal_rounded = (
+                    math.floor(value * factor + 0.5) / factor
+                    if value >= 0
+                    else -math.floor(-value * factor + 0.5) / factor
+                )
+
     @api.onchange('product_id')
     def _onchange_product_bp_tax(self):
-        """
-        Saat produk dipilih, terapkan tax dari mapping WH jika bp_tax
-        partner cocok. Fallback ke gm_bp_tax partner jika tidak ada mapping.
-        """
         if not self.product_id:
             return
 
@@ -490,10 +646,6 @@ class SaleOrderLine(models.Model):
 
     @api.onchange('tax_id')
     def _onchange_tax_id_check_mapping(self):
-        """
-        Saat user mengubah tax di order line, cek apakah sesuai mapping.
-        Jika tidak sesuai → kembalikan paksa ke mapping_tax + warning.
-        """
         if not self.tax_id:
             return
 
@@ -528,9 +680,18 @@ class SaleOrderLine(models.Model):
 
     def write(self, vals):
         if 'price_unit' in vals:
-            config = self.env['ir.config_parameter'].sudo()
-            manager_validation = config.get_param('pos.manager_validation', 'False') == 'True'
-            validate_price_change = config.get_param('pos.validate_price_change', 'False') == 'True'
+            order = self.order_id
+            if order:
+                pos_config = order._get_pos_config_by_warehouse()
+                if pos_config:
+                    manager_validation = pos_config.manager_validation
+                    validate_price_change = pos_config.validate_price_change
+                else:
+                    manager_validation = False
+                    validate_price_change = False
+            else:
+                manager_validation = False
+                validate_price_change = False
 
             if manager_validation and validate_price_change:
                 if not self.env.context.get('pin_validated'):
@@ -550,7 +711,7 @@ class SaleOrderLine(models.Model):
 
 
 # ══════════════════════════════════════════════════════════
-# 5. Wizard: validasi PIN untuk ubah harga
+# 5. Wizard: validasi PIN untuk ubah harga (dengan info manager)
 # ══════════════════════════════════════════════════════════
 class SalePricePinWizard(models.TransientModel):
     _name = 'sale.price.pin.wizard'
@@ -566,18 +727,43 @@ class SalePricePinWizard(models.TransientModel):
         string='Catatan', readonly=True,
         default='Masukkan PIN Manager untuk mengubah harga.',
     )
+    manager_id = fields.Many2one('hr.employee', string='Manager', readonly=True)
+
+    def default_get(self, fields_list):
+        res = super().default_get(fields_list)
+        order_id = self.env.context.get('default_order_id')
+        if order_id and 'manager_id' in fields_list:
+            order = self.env['sale.order'].browse(order_id)
+            if order:
+                pos_config = order._get_pos_config_by_warehouse()
+                if pos_config and pos_config.manager_id:
+                    res['manager_id'] = pos_config.manager_id.id
+        return res
 
     def action_validate(self):
         self.ensure_one()
-        config = self.env['ir.config_parameter'].sudo()
+        order = self.order_id
+        if not order:
+            raise UserError(_("Sale Order tidak ditemukan."))
 
-        manager_id = config.get_param('pos.manager_id')
-        if not manager_id:
-            raise UserError(_("Manager belum dikonfigurasi di POS Settings."))
+        pos_config = order._get_pos_config_by_warehouse()
+        if not pos_config:
+            raise UserError(_(
+                "Tidak ditemukan konfigurasi POS untuk warehouse '%s'. "
+                "Pastikan warehouse sudah dihubungkan dengan POS Config."
+            ) % (order.warehouse_id.name if order.warehouse_id else '-'))
 
-        manager = self.env['hr.employee'].sudo().browse(int(manager_id))
-        if not manager.exists():
-            raise UserError(_("Manager tidak ditemukan."))
+        if not pos_config.manager_validation or not pos_config.validate_price_change:
+            raise UserError(_(
+                "Fitur validasi harga tidak diaktifkan di POS Config untuk warehouse '%s'."
+            ) % order.warehouse_id.name)
+
+        manager = pos_config.manager_id
+        if not manager:
+            raise UserError(_(
+                "Manager belum dikonfigurasi di POS Settings untuk warehouse '%s'. "
+                "Silakan isi field 'Manager' pada POS Config yang terhubung dengan warehouse ini."
+            ) % order.warehouse_id.name)
 
         if str(manager.pin) != str(self.pin):
             raise UserError(_("PIN salah. Silakan coba lagi."))
@@ -587,8 +773,8 @@ class SalePricePinWizard(models.TransientModel):
         })
 
         _logger.info(
-            "Harga diubah oleh manager '%s': line %s  %.2f → %.2f",
-            manager.name, self.order_line_id.id, self.current_price, self.new_price,
+            "Harga diubah oleh manager '%s' (warehouse %s): line %s  %.2f → %.2f",
+            manager.name, order.warehouse_id.name, self.order_line_id.id, self.current_price, self.new_price,
         )
 
         return {

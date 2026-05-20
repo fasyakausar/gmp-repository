@@ -1,6 +1,7 @@
 from odoo import http, api, SUPERUSER_ID
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from odoo.http import request
+import werkzeug.exceptions
 import requests
 from datetime import datetime
 import json
@@ -687,6 +688,25 @@ def bulk_update_pricelist_lines(cr, updates):
         WHERE ppi.id = v.id::int
     """, rows)
 
+def bulk_sync_variant_active(cr, tmpl_ids):
+    """
+    Menyamakan product_product.active dengan product_template.active
+    untuk daftar template_id tertentu, dalam SATU query.
+    Aman dipanggil berulang (idempotent) - hanya menyentuh baris
+    yang benar-benar berbeda (WHERE pp.active != pt.active).
+    """
+    if not tmpl_ids:
+        return
+ 
+    cr.execute("""
+        UPDATE product_product AS pp
+        SET active = pt.active
+        FROM product_template AS pt
+        WHERE pp.product_tmpl_id = pt.id
+          AND pt.id = ANY(%s)
+          AND pp.active != pt.active
+    """, (list(tmpl_ids),))
+
 
 # ── Tunable constants ────────────────────────────────────────────────────────
 CHUNK_CREATE = 500   # rows per bulk INSERT  (tunable: 200–500)
@@ -701,17 +721,13 @@ class POSTMasterItem(http.Controller):
     @http.route('/api/master_item', type='json', auth='none', methods=['POST'], csrf=False)
     def post_master_item(self, **kw):
         try:
-            # ── Autentikasi ──────────────────────────────────────────────────
             check_authorization()
- 
             env = get_authenticated_env('mc')
  
-            # ── Validate companies ───────────────────────────────────────────
             companies = env['res.company'].sudo().search([('active', '=', True)])
             if not companies:
                 return {'status': 'Failed', 'code': 404, 'message': 'No active companies found.'}
  
-            # ── Parse payload ────────────────────────────────────────────────
             json_data = request.get_json_data()
             items = json_data.get('items', [])
             if isinstance(items, dict):
@@ -728,29 +744,23 @@ class POSTMasterItem(http.Controller):
  
             company_ids = companies.ids
  
-            # ── Pre-fetch lookup tables (ONE query each, shared across all companies) ──
- 
             all_product_codes = [i['product_code'] for i in items if i.get('product_code')]
  
-            # {(default_code, company_id): product.template browse record}
             existing_products_map: dict = {}
             if all_product_codes:
                 recs = env['product.template'].sudo().with_context(active_test=False).search(
                     [('default_code', 'in', all_product_codes),
                      ('company_id', 'in', company_ids)],
-                    # Only fetch fields we actually need for the result dict
                 )
                 for p in recs:
                     existing_products_map[(p.default_code, p.company_id.id)] = p
  
-            # Category cache  {complete_name: id}
             cat_names = list({i['category_name'] for i in items if i.get('category_name')})
             category_cache: dict = {}
             if cat_names:
                 cats = env['product.category'].sudo().search([('complete_name', 'in', cat_names)])
                 category_cache = {c.complete_name: c.id for c in cats}
  
-            # POS category cache  {name: id}
             pos_names: set = set()
             for i in items:
                 raw = i.get('pos_categ_ids', i.get('pos_categ_id', []))
@@ -762,7 +772,6 @@ class POSTMasterItem(http.Controller):
                 pos_cats = env['pos.category'].sudo().search([('name', 'in', list(pos_names))])
                 pos_cache = {c.name: c.id for c in pos_cats}
  
-            # Tax cache  {(name, company_id): id}  — company_id may be None (global tax)
             tax_names_all: set = set()
             for i in items:
                 raw = i.get('taxes_names', i.get('taxes_name', []))
@@ -779,7 +788,6 @@ class POSTMasterItem(http.Controller):
                     key = (t.name, t.company_id.id if t.company_id else None)
                     tax_cache.setdefault(key, t.id)
  
-            # UOM cache  {name_or_id: uom_id}
             uom_cache: dict = {}
  
             def resolve_uom(val):
@@ -793,7 +801,6 @@ class POSTMasterItem(http.Controller):
                 uom_cache[val] = result
                 return result
  
-            # ── Helper: build product_data dict ──────────────────────────────
             def build_product_data(data_item, company_id, create_uid=None):
                 active = data_item.get('active', True)
                 if not isinstance(active, bool):
@@ -865,10 +872,9 @@ class POSTMasterItem(http.Controller):
  
                 return data
  
-            # ── Per-company processing ────────────────────────────────────────
             for company in companies:
-                to_create: list = []   # [(data_item, product_data), ...]
-                to_update: list = []   # [(data_item, existing_record, product_data), ...]
+                to_create: list = []
+                to_update: list = []
  
                 for data_item in items:
                     product_code = data_item.get('product_code')
@@ -888,7 +894,11 @@ class POSTMasterItem(http.Controller):
                     else:
                         to_create.append((data_item, pdata))
  
-                # ── CHUNK UPDATE (row-by-row inside savepoints) ───────────────
+                # >>> FIX: kumpulkan template_id yang di-touch di company ini,
+                # supaya bisa disinkronkan active-nya sekali di akhir.
+                touched_tmpl_ids = []
+ 
+                # ── CHUNK UPDATE ───────────────────────────────────────────
                 for chunk_start in range(0, len(to_update), CHUNK_UPDATE):
                     chunk = to_update[chunk_start: chunk_start + CHUNK_UPDATE]
                     for data_item, existing, pdata in chunk:
@@ -897,6 +907,7 @@ class POSTMasterItem(http.Controller):
                             env.cr.execute(f'SAVEPOINT "{sp}"')
                             existing.with_context(force_uom_update=True).write(pdata)
                             env.cr.execute(f'RELEASE SAVEPOINT "{sp}"')
+                            touched_tmpl_ids.append(existing.id)  # >>> FIX
                             updated.append({
                                 'id':              existing.id,
                                 'product_code':    existing.default_code,
@@ -914,7 +925,7 @@ class POSTMasterItem(http.Controller):
                             _rollback(env, sp)
                             failed.append(_fail(data_item, company, f'Update error: {e}'))
  
-                # ── CHUNK CREATE (bulk INSERT per chunk, fallback to single) ──
+                # ── CHUNK CREATE ───────────────────────────────────────────
                 for chunk_start in range(0, len(to_create), CHUNK_CREATE):
                     chunk = to_create[chunk_start: chunk_start + CHUNK_CREATE]
                     sp = f'bulk_create_{company.id}_{chunk_start}'
@@ -924,6 +935,7 @@ class POSTMasterItem(http.Controller):
                             [pdata for _, pdata in chunk]
                         )
                         env.cr.execute(f'RELEASE SAVEPOINT "{sp}"')
+                        touched_tmpl_ids.extend(products.ids)  # >>> FIX
                         for product, (data_item, _) in zip(products, chunk):
                             created.append(_created_row(product, company))
                     except Exception as bulk_err:
@@ -932,7 +944,6 @@ class POSTMasterItem(http.Controller):
                             'Bulk create failed for company=%s chunk=%s, falling back to single. err=%s',
                             company.id, chunk_start, bulk_err
                         )
-                        # Fallback: one-by-one to preserve as many records as possible
                         for data_item, pdata in chunk:
                             code = pdata.get('default_code', 'x')
                             sp2 = f'single_create_{company.id}_{code}'
@@ -940,10 +951,25 @@ class POSTMasterItem(http.Controller):
                                 env.cr.execute(f'SAVEPOINT "{sp2}"')
                                 product = env['product.template'].sudo().create(pdata)
                                 env.cr.execute(f'RELEASE SAVEPOINT "{sp2}"')
+                                touched_tmpl_ids.append(product.id)  # >>> FIX
                                 created.append(_created_row(product, company))
                             except Exception as e2:
                                 _rollback(env, sp2)
                                 failed.append(_fail(data_item, company, f'Create error: {e2}'))
+ 
+                # >>> FIX: sinkronkan active product_product <- product_template
+                # SEKALI per company (bulk SQL), setelah semua create/update selesai.
+                # Ini menutup celah "reactivate template tidak ikut reaktivasi variant".
+                if touched_tmpl_ids:
+                    try:
+                        bulk_sync_variant_active(env.cr, touched_tmpl_ids)
+                    except Exception as sync_err:
+                        _logger.error(
+                            'Gagal sinkronisasi active variant untuk company=%s: %s',
+                            company.id, sync_err, exc_info=True
+                        )
+                        # tidak menggagalkan seluruh request - hanya di-log,
+                        # karena create/update produk utamanya sudah berhasil.
  
             env.cr.commit()
  
@@ -2805,6 +2831,8 @@ def _authenticate(env):
     return uid, None
 
 
+# ── Shared helpers ───────────────────────────────────────────────────────
+ 
 def _validate_company(env, company_name):
     """Validate and return company."""
     company = env['res.company'].sudo().search([('name', '=', company_name)], limit=1)
@@ -2814,16 +2842,16 @@ def _validate_company(env, company_name):
             'message': f"Company '{company_name}' not found."
         }
     return company, None
-
-
+ 
+ 
 def _validate_locations(env, location_id, location_dest_id, company_id, company_name):
     """Bulk-validate source and destination locations."""
     locations = env['stock.location'].sudo().browse([location_id, location_dest_id])
     loc_map = {loc.id: loc for loc in locations}
-
+ 
     source = loc_map.get(location_id)
     dest = loc_map.get(location_dest_id)
-
+ 
     if not source or not source.exists():
         return None, None, {'status': "Failed", 'code': 400, 'message': f"Source location ID {location_id} not found."}
     if not dest or not dest.exists():
@@ -2839,43 +2867,65 @@ def _validate_locations(env, location_id, location_dest_id, company_id, company_
             'message': f"Destination location belongs to '{dest.company_id.name}', not '{company_name}'."
         }
     return source, dest, None
-
-
+ 
+ 
 def _bulk_validate_products(env, move_lines, company_id, company_name):
     """
     Bulk-fetch all products in ONE query.
     Returns (product_map, errors_list).
     product_map = {product_code: product_record}
+ 
+    >>> FIX: gunakan active_test=False supaya produk yang
+    variant-nya sempat inactive (mismatch dengan template)
+    tetap ketemu, dan pesan error membedakan
+    "tidak ditemukan" vs "ditemukan tapi inactive" -
+    jauh lebih mudah didiagnosis daripada error generik.
     """
     product_codes = list({line.get('product_code') for line in move_lines if line.get('product_code')})
-
-    products = env['product.product'].sudo().search([
+ 
+    products = env['product.product'].sudo().with_context(active_test=False).search([
         ('default_code', 'in', product_codes),
         '|',
         ('company_id', '=', company_id),
         ('company_id', '=', False)
     ])
-
+ 
     product_map = {}
+    inactive_codes = []
     for p in products:
+        if not p.active:
+            inactive_codes.append(p.default_code)
+            continue
         if p.default_code not in product_map or p.company_id.id == company_id:
             product_map[p.default_code] = p
-
-    missing = [code for code in product_codes if code not in product_map]
+ 
+    missing = [
+        code for code in product_codes
+        if code not in product_map and code not in inactive_codes
+    ]
+ 
+    errors = []
     if missing:
-        return None, [{
+        errors.append({
             'status': "Failed", 'code': 400,
             'message': f"Products not found or not accessible for company '{company_name}': {', '.join(missing)}"
-        }]
+        })
+    if inactive_codes:
+        errors.append({
+            'status': "Failed", 'code': 400,
+            'message': f"Products found but inactive/archived for company '{company_name}': {', '.join(inactive_codes)}"
+        })
+    if errors:
+        return None, errors
     return product_map, []
-
-
+ 
+ 
 def _validate_move_line_quantities(move_lines):
     """Validate quantities in move lines, return errors list."""
     errors = []
     for idx, line in enumerate(move_lines):
         qty = line.get('product_uom_qty')
-        code = line.get('product_code', f'Line {idx+1}')
+        code = line.get('product_code', f'Line {idx + 1}')
         if qty is None:
             errors.append(f"{code}: missing quantity")
             continue
@@ -2885,24 +2935,54 @@ def _validate_move_line_quantities(move_lines):
         except (ValueError, TypeError):
             errors.append(f"{code}: invalid quantity format")
     return errors
-
-
+ 
+ 
+_MOVE_CONTEXT = {
+    'tracking_disable': True,
+    'mail_notrack': True,
+    'mail_notify_force_send': False,
+    'no_recompute': True,
+}
+ 
+ 
+def _build_move_vals_list(move_lines, product_map, picking_id, source_loc, dest_loc, company_id):
+    move_vals_list = []
+    for line in move_lines:
+        product = product_map[line['product_code']]
+        qty = float(line['product_uom_qty'])
+        move_vals_list.append({
+            'name': product.name,
+            'product_id': product.id,
+            'product_uom': product.uom_id.id,
+            'product_uom_qty': qty,
+            'quantity': qty,
+            'picking_id': picking_id,
+            'location_id': source_loc.id,
+            'location_dest_id': dest_loc.id,
+            'company_id': company_id,
+            'state': 'draft',
+        })
+    return move_vals_list
+ 
+ 
+# ── Goods Receipt ────────────────────────────────────────────────────────
+ 
 class POSTGoodsReceipt(http.Controller):
+ 
     @http.route('/api/goods_receipt', type='json', auth='none', methods=['POST'], csrf=False)
     def post_goods_receipt(self, **kw):
         try:
-            env = request.env
-            uid, auth_error = _authenticate(env)
-            if auth_error:
-                return auth_error
-
+            # ── Auth ──────────────────────────────────────────────────
+            check_authorization()
+            env = get_authenticated_env()
+ 
             data = request.get_json_data()
-
-            # ── Required field checks ──────────────────────────────────────
+ 
+            # ── Required field checks ────────────────────────────────
             company_name = data.get('company_name')
             if not company_name:
                 return {'status': "Failed", 'code': 400, 'message': "Field 'company_name' is required."}
-
+ 
             picking_type_name = data.get('picking_type')
             location_id       = data.get('location_id')
             location_dest_id  = data.get('location_dest_id')
@@ -2911,14 +2991,14 @@ class POSTGoodsReceipt(http.Controller):
             transaction_id    = data.get('transaction_id')
             move_type         = data.get('move_type')
             move_lines        = data.get('move_lines', [])
-
-            # ── Company ───────────────────────────────────────────────────
+ 
+            # ── Company ───────────────────────────────────────────────
             company, err = _validate_company(env, company_name)
             if err:
                 return err
             company_id = company.id
-
-            # ── Duplicate check ───────────────────────────────────────────
+ 
+            # ── Duplicate check ──────────────────────────────────────
             existing = env['stock.picking'].sudo().search([
                 ('vit_trxid', '=', transaction_id),
                 ('picking_type_id.name', '=', 'Goods Receipts'),
@@ -2931,8 +3011,8 @@ class POSTGoodsReceipt(http.Controller):
                     'id': existing.id, 'doc_num': existing.name,
                     'company_name': existing.company_id.name
                 }
-
-            # ── Picking type ──────────────────────────────────────────────
+ 
+            # ── Picking type ─────────────────────────────────────────
             picking_type = env['stock.picking.type'].sudo().search([
                 ('name', '=', picking_type_name),
                 ('default_location_dest_id', '=', location_dest_id),
@@ -2941,35 +3021,27 @@ class POSTGoodsReceipt(http.Controller):
             if not picking_type:
                 return {'status': "Failed", 'code': 400,
                         'message': f"Picking type '{picking_type_name}' not found for company '{company.name}'."}
-
-            # ── Locations ─────────────────────────────────────────────────
+ 
+            # ── Locations ─────────────────────────────────────────────
             source_loc, dest_loc, err = _validate_locations(
                 env, location_id, location_dest_id, company_id, company.name)
             if err:
                 return err
-
-            # ── Products & Quantities ─────────────────────────────────────
+ 
+            # ── Products & Quantities ────────────────────────────────
             if not move_lines:
                 return {'status': "Failed", 'code': 400, 'message': "move_lines cannot be empty."}
-
+ 
             qty_errors = _validate_move_line_quantities(move_lines)
             product_map, prod_errors = _bulk_validate_products(env, move_lines, company_id, company.name)
-
+ 
             all_errors = (prod_errors or []) + (["Invalid quantities: " + ", ".join(qty_errors)] if qty_errors else [])
             if all_errors:
                 return {'status': "Failed", 'code': 400, 'message': "; ".join(
                     e['message'] if isinstance(e, dict) else e for e in all_errors)}
-
-            # ── Context untuk disable mail/tracking ───────────────────────
-            ctx = {
-                'tracking_disable': True,
-                'mail_notrack': True,
-                'mail_notify_force_send': False,
-                'no_recompute': True,
-            }
-
-            # ── Create picking ────────────────────────────────────────────
-            goods_receipt = env['stock.picking'].sudo().with_context(**ctx).create({
+ 
+            # ── Create picking ───────────────────────────────────────
+            goods_receipt = env['stock.picking'].sudo().with_context(**_MOVE_CONTEXT).create({
                 'picking_type_id': picking_type.id,
                 'location_id': source_loc.id,
                 'location_dest_id': dest_loc.id,
@@ -2979,35 +3051,21 @@ class POSTGoodsReceipt(http.Controller):
                 'vit_trxid': transaction_id,
                 'company_id': company_id,
             })
-
-            # ── Bulk create move lines ────────────────────────────────────
-            move_vals_list = []
-            for line in move_lines:
-                product = product_map[line['product_code']]
-                qty = float(line['product_uom_qty'])
-                move_vals_list.append({
-                    'name': product.name,
-                    'product_id': product.id,
-                    'product_uom': product.uom_id.id,
-                    'product_uom_qty': qty,
-                    'quantity': qty,
-                    'picking_id': goods_receipt.id,
-                    'location_id': source_loc.id,
-                    'location_dest_id': dest_loc.id,
-                    'company_id': company_id,
-                    'state': 'draft',
-                })
-            env['stock.move'].sudo().with_context(**ctx).create(move_vals_list)
-
-            # ── Unlink followers & Validate ───────────────────────────────
+ 
+            # ── Bulk create move lines ───────────────────────────────
+            move_vals_list = _build_move_vals_list(
+                move_lines, product_map, goods_receipt.id, source_loc, dest_loc, company_id)
+            env['stock.move'].sudo().with_context(**_MOVE_CONTEXT).create(move_vals_list)
+ 
+            # ── Unlink followers & Validate ──────────────────────────
             goods_receipt.sudo().message_follower_ids.unlink()
             goods_receipt.sudo().with_context(
-                **ctx,
+                **_MOVE_CONTEXT,
                 skip_backorder=True,
                 immediate_transfer=True,
                 skip_subscribe=True,
             ).button_validate()
-
+ 
             return {
                 'code': 200, 'status': 'success',
                 'message': 'Goods Receipt created and validated successfully',
@@ -3015,32 +3073,37 @@ class POSTGoodsReceipt(http.Controller):
                 'doc_num': goods_receipt.name,
                 'company_name': goods_receipt.company_id.name
             }
-
+ 
+        except werkzeug.exceptions.Unauthorized as e:
+            return {'status': "Failed", 'code': 401, 'message': str(e)}
+ 
         except Exception as e:
             request.env.cr.rollback()
             _logger.error("Failed to create Goods Receipt: %s", e, exc_info=True)
             return {'status': "Failed", 'code': 500, 'message': f"Failed to create Goods Receipt: {e}"}
-
-
+ 
+ 
+# ── Goods Issue ──────────────────────────────────────────────────────────
+ 
 class POSTGoodsIssue(http.Controller):
+ 
     @http.route('/api/goods_issue', type='json', auth='none', methods=['POST'], csrf=False)
     def post_goods_issue(self, **kw):
         try:
-            env = request.env
-            uid, auth_error = _authenticate(env)
-            if auth_error:
-                return auth_error
-
+            # ── Auth ──────────────────────────────────────────────────
+            check_authorization()
+            env = get_authenticated_env()
+ 
             data = request.get_json_data()
-
-            # ── Required fields ───────────────────────────────────────────
+ 
+            # ── Required fields ──────────────────────────────────────
             required_fields = ['company_name', 'picking_type', 'location_id', 'location_dest_id',
-                               'scheduled_date', 'transaction_id', 'move_type', 'move_lines']
+                                'scheduled_date', 'transaction_id', 'move_type', 'move_lines']
             missing_fields = [f for f in required_fields if not data.get(f)]
             if missing_fields:
                 return {'status': "Failed", 'code': 400,
                         'message': f"Missing required fields: {', '.join(missing_fields)}"}
-
+ 
             company_name      = data['company_name']
             picking_type_name = data['picking_type']
             location_id       = data['location_id']
@@ -3050,14 +3113,14 @@ class POSTGoodsIssue(http.Controller):
             transaction_id    = data['transaction_id']
             move_type         = data['move_type']
             move_lines        = data['move_lines']
-
-            # ── Company ───────────────────────────────────────────────────
+ 
+            # ── Company ───────────────────────────────────────────────
             company, err = _validate_company(env, company_name)
             if err:
                 return err
             company_id = company.id
-
-            # ── Duplicate check ───────────────────────────────────────────
+ 
+            # ── Duplicate check ──────────────────────────────────────
             existing = env['stock.picking'].sudo().search([
                 ('vit_trxid', '=', transaction_id),
                 ('picking_type_id.name', '=', 'Goods Issue'),
@@ -3070,8 +3133,8 @@ class POSTGoodsIssue(http.Controller):
                     'data': {'id': existing.id, 'doc_num': existing.name,
                              'company_name': existing.company_id.name}
                 }
-
-            # ── Picking type ──────────────────────────────────────────────
+ 
+            # ── Picking type ─────────────────────────────────────────
             picking_type = env['stock.picking.type'].sudo().search([
                 ('name', '=', picking_type_name),
                 ('default_location_src_id', '=', location_id),
@@ -3080,31 +3143,23 @@ class POSTGoodsIssue(http.Controller):
             if not picking_type:
                 return {'status': "Failed", 'code': 400,
                         'message': f"Picking type '{picking_type_name}' not found for company '{company.name}'."}
-
-            # ── Locations ─────────────────────────────────────────────────
+ 
+            # ── Locations ─────────────────────────────────────────────
             source_loc, dest_loc, err = _validate_locations(
                 env, location_id, location_dest_id, company_id, company.name)
             if err:
                 return err
-
-            # ── Quantity & Products ───────────────────────────────────────
+ 
+            # ── Quantity & Products ──────────────────────────────────
             qty_errors = _validate_move_line_quantities(move_lines)
             product_map, prod_errors = _bulk_validate_products(env, move_lines, company_id, company.name)
-
+ 
             all_errors = (prod_errors or []) + (["Invalid quantities: " + ", ".join(qty_errors)] if qty_errors else [])
             if all_errors:
                 return {'status': "Failed", 'code': 400, 'message': "; ".join(
                     e['message'] if isinstance(e, dict) else e for e in all_errors)}
-
-            # ── Context untuk disable mail/tracking ───────────────────────
-            ctx = {
-                'tracking_disable': True,
-                'mail_notrack': True,
-                'mail_notify_force_send': False,
-                'no_recompute': True,
-            }
-
-            # ── Create picking ────────────────────────────────────────────
+ 
+            # ── Create picking ───────────────────────────────────────
             gi_vals = {
                 'picking_type_id': picking_type.id,
                 'location_id': source_loc.id,
@@ -3116,37 +3171,23 @@ class POSTGoodsIssue(http.Controller):
             }
             if date_done:
                 gi_vals['date_done'] = date_done
-
-            goods_issue = env['stock.picking'].sudo().with_context(**ctx).create(gi_vals)
-
-            # ── Bulk create move lines ────────────────────────────────────
-            move_vals_list = []
-            for line in move_lines:
-                product = product_map[line['product_code']]
-                qty = float(line['product_uom_qty'])
-                move_vals_list.append({
-                    'name': product.name,
-                    'product_id': product.id,
-                    'product_uom': product.uom_id.id,
-                    'product_uom_qty': qty,
-                    'quantity': qty,
-                    'picking_id': goods_issue.id,
-                    'location_id': source_loc.id,
-                    'location_dest_id': dest_loc.id,
-                    'company_id': company_id,
-                    'state': 'draft',
-                })
-            env['stock.move'].sudo().with_context(**ctx).create(move_vals_list)
-
-            # ── Unlink followers & Validate ───────────────────────────────
+ 
+            goods_issue = env['stock.picking'].sudo().with_context(**_MOVE_CONTEXT).create(gi_vals)
+ 
+            # ── Bulk create move lines ───────────────────────────────
+            move_vals_list = _build_move_vals_list(
+                move_lines, product_map, goods_issue.id, source_loc, dest_loc, company_id)
+            env['stock.move'].sudo().with_context(**_MOVE_CONTEXT).create(move_vals_list)
+ 
+            # ── Unlink followers & Validate ──────────────────────────
             goods_issue.sudo().message_follower_ids.unlink()
             goods_issue.sudo().with_context(
-                **ctx,
+                **_MOVE_CONTEXT,
                 skip_backorder=True,
                 immediate_transfer=True,
                 skip_subscribe=True,
             ).button_validate()
-
+ 
             return {
                 'code': 200, 'status': 'success',
                 'message': 'Goods Issue created and validated successfully',
@@ -3156,7 +3197,10 @@ class POSTGoodsIssue(http.Controller):
                     'company_name': goods_issue.company_id.name
                 }
             }
-
+ 
+        except werkzeug.exceptions.Unauthorized as e:
+            return {'status': "Failed", 'code': 401, 'message': str(e)}
+ 
         except Exception as e:
             request.env.cr.rollback()
             _logger.error("Failed to create Goods Issue: %s", e, exc_info=True)

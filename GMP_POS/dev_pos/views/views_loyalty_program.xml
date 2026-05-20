@@ -20,7 +20,7 @@
 
         <!-- sembunyikan button Generate Gift Cards -->
         <xpath expr="//header/button[2]" position="attributes">
-            <attribute name="invisible">1</attribute>
+            <attribute name="invisible">not is_admin_access</attribute>
         </xpath>
 
         <xpath expr="//field[@name='date_to']" position="after">

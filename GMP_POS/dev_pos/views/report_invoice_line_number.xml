@@ -1,25 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
     <data>
-        <!-- Inherit report_invoice_document to add line number column -->
         <template id="report_invoice_document_line_number" inherit_id="account.report_invoice_document">
 
-            <!-- Add "No" header column before Description -->
+            <!-- ============ 1. Kolom "No" ============ -->
             <xpath expr="//th[@name='th_description']" position="before">
                 <th name="th_no" class="text-center" style="width: 40px;">
                     <span>No</span>
                 </th>
             </xpath>
 
-            <!-- Add line number cell for product lines -->
             <xpath expr="//td[@name='account_invoice_line_name']" position="before">
                 <td name="td_no" class="text-center">
                     <span t-esc="line_index + 1"/>
                 </td>
             </xpath>
 
-            <!-- Add empty cell for section lines (colspan already covers all, just shift) -->
-            <!-- Section and note lines use colspan=99 so no extra td needed -->
+            <!-- ============ 2. Subtotal per baris dibulatkan ============ -->
+            <xpath expr="//span[@t-field='line.price_subtotal']" position="replace">
+                <span class="text-nowrap" t-field="line.price_subtotal_rounded"
+                      t-options="{'widget': 'monetary', 'display_currency': line.currency_id}"/>
+            </xpath>
+
+            <!-- ============ 3. Grand total (untaxed/tax/total) dibulatkan ============ -->
+            <xpath expr="//t[@t-set='tax_totals']" position="replace">
+                <t t-set="tax_totals" t-value="o._get_rounded_tax_totals() or {}"/>
+            </xpath>
 
         </template>
     </data>

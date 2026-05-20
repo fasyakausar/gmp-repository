@@ -21,7 +21,11 @@ class SalesReportDetailController(http.Controller):
         return None
     
     def format_number(self, number):
-        return f"{number:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        # Pemisah ribuan pakai koma (,), desimal pakai titik (.).
+        # Tidak ada pembulatan ke bilangan bulat — nilai asli ditampilkan
+        # apa adanya dengan 2 angka di belakang koma.
+        value = float(number or 0)
+        return f"{value:,.2f}"
 
     @http.route('/my/sales/report/detail', type='http', auth='user', website=True)
     def portal_sales_report_detail(self, **kw):
