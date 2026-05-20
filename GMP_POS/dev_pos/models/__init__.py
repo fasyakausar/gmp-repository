@@ -59,3 +59,4 @@ from . import stock_picking_return
 from . import sale_order
 from . import mapping_tax_sap
 # from . import res_users
+from . import report_inv_rounding

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <template id="report_saleorder_document_rounding"
+                  inherit_id="sale.report_saleorder_document">
+
+            <!-- ============ 1. Subtotal per baris produk dibulatkan half-up ============ -->
+            <xpath expr="//td[@name='td_subtotal']/span[@t-field='line.price_subtotal']"
+                   position="replace">
+                <span class="text-nowrap" t-field="line.price_subtotal_rounded"
+                      t-options="{'widget': 'monetary', 'display_currency': doc.currency_id}"/>
+            </xpath>
+
+            <!-- ============ 2. Subtotal per section dibulatkan half-up ============ -->
+            <xpath expr="//td[@name='td_section_subtotal']/span[@t-options]"
+                   position="replace">
+                <span t-esc="doc.currency_id.format(doc._round_half_up(current_subtotal))"/>
+            </xpath>
+
+            <!-- ============ 3. Grand total (untaxed/tax/total) dibulatkan half-up ============ -->
+            <xpath expr="//t[@t-set='tax_totals']" position="attributes">
+                <attribute name="t-value">doc._get_rounded_tax_totals()</attribute>
+            </xpath>
+
+        </template>
+    </data>
+</odoo>

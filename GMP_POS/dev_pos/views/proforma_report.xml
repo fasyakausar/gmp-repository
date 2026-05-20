@@ -6,15 +6,14 @@
             <t t-call="web.external_layout">
                 <t t-set="o" t-value="o.with_context(lang=lang)" />
                 <t t-set="proforma" t-value="True" />
-                
+
                 <!-- Title: PROFORMA INVOICE -->
                 <div class="text-center mb-4">
                     <h2><strong>PROFORMA INVOICE</strong></h2>
                 </div>
-                
+
                 <!-- Invoice Information + Customer -->
                 <div class="row mb-4">
-                    <!-- Left: Invoice Info -->
                     <div class="col-6">
                         <table class="table table-sm table-borderless">
                             <tr>
@@ -36,9 +35,7 @@
                         </table>
                     </div>
 
-                    <!-- Right: Customer + Ship To + Payment Terms -->
                     <div class="col-6">
-                        <!-- Customer / Bill To -->
                         <table class="table table-sm table-borderless">
                             <tr>
                                 <td style="width: 35%;"><strong>Bill To:</strong></td>
@@ -82,7 +79,7 @@
                         </table>
                     </div>
                 </div>
-                
+
                 <!-- Order Lines Table -->
                 <table class="table table-bordered">
                     <thead>
@@ -102,8 +99,7 @@
                                 <tr>
                                     <td class="text-center" t-out="line_number"/>
                                     <td class="text-start">
-                                        <span t-field="line.product_id.name"/><br/>
-                                        <small><span t-field="line.name" t-options="{'widget': 'text'}"/></small>
+                                        <span t-field="line.name" t-options="{'widget': 'text'}"/>
                                     </td>
                                     <td class="text-center">
                                         <span t-field="line.product_uom_qty"/>
@@ -116,8 +112,9 @@
                                         <span t-field="line.discount" t-if="line.discount > 0"/>
                                         <span t-if="line.discount == 0">-</span>
                                     </td>
+                                    <!-- SUBTOTAL PER BARIS: dibulatkan HALF-UP -->
                                     <td class="text-end">
-                                        <span t-field="line.price_subtotal" t-options='{"widget": "monetary", "display_currency": o.currency_id}'/>
+                                        <span t-esc="o.currency_id.format(o._round_half_up(line.price_subtotal))"/>
                                     </td>
                                 </tr>
                                 <t t-set="line_number" t-value="line_number + 1"/>
@@ -125,19 +122,17 @@
                         </t>
                     </tbody>
                 </table>
-                
+
                 <!-- Totals Section -->
                 <div class="row mt-4">
                     <div class="col-8">
-                        <!-- Terms and Conditions -->
                         <div t-if="o.note">
                             <strong>Terms and Conditions:</strong><br/>
                             <div style="text-align: justify; text-justify: inter-word;">
                                 <span t-field="o.note" t-options="{'widget': 'text'}"/>
                             </div>
                         </div>
-                        
-                        <!-- Disclaimer -->
+
                         <div class="mt-4">
                             <p class="text-muted">
                                 <small>
@@ -146,17 +141,17 @@
                             </p>
                         </div>
                     </div>
-                    
+
                     <div class="col-4">
-                        <!-- Summary Table -->
                         <table class="table table-sm table-borderless float-end" style="width: 80%;">
+                            <!-- SUBTOTAL (Untaxed): dibulatkan HALF-UP -->
                             <tr>
                                 <td class="text-end"><strong>Subtotal:</strong></td>
                                 <td class="text-end" style="width: 40%;">
-                                    <span t-field="o.amount_untaxed" t-options='{"widget": "monetary", "display_currency": o.currency_id}'/>
+                                    <span t-esc="o.currency_id.format(o._round_half_up(o.amount_untaxed))"/>
                                 </td>
                             </tr>
-                            
+
                             <!-- Tax Lines -->
                             <t t-set="taxes_summary" t-value="{}"/>
                             <t t-foreach="o.order_line" t-as="line">
@@ -174,6 +169,7 @@
                                 </t>
                             </t>
 
+                            <!-- TAX per group: dibulatkan HALF-UP -->
                             <t t-foreach="taxes_summary.items()" t-as="tax_item">
                                 <tr>
                                     <td class="text-end">
@@ -187,16 +183,17 @@
                                         <span t-out="tax_name"/>
                                     </td>
                                     <td class="text-end">
-                                        <span t-out="tax_item[1]" t-options='{"widget": "monetary", "display_currency": o.currency_id}'/>
+                                        <span t-esc="o.currency_id.format(o._round_half_up(tax_item[1]))"/>
                                     </td>
                                 </tr>
                             </t>
-                            
+
+                            <!-- TOTAL: dibulatkan HALF-UP -->
                             <tr style="border-top: 2px solid #000;">
                                 <td class="text-end"><strong>TOTAL:</strong></td>
                                 <td class="text-end">
                                     <strong>
-                                        <span t-field="o.amount_total" t-options='{"widget": "monetary", "display_currency": o.currency_id}'/>
+                                        <span t-esc="o.currency_id.format(o._round_half_up(o.amount_total))"/>
                                     </strong>
                                 </td>
                             </tr>
@@ -205,7 +202,7 @@
                 </div>
             </t>
         </template>
-        
+
         <!-- Main Report Template -->
         <template id="report_proforma_invoice">
             <t t-call="web.html_container">
@@ -215,7 +212,7 @@
                 </t>
             </t>
         </template>
-        
+
         <!-- Report Action Definition -->
         <record id="action_report_proforma_invoice" model="ir.actions.report">
             <field name="name">Proforma Invoice</field>
@@ -226,7 +223,7 @@
             <field name="binding_model_id" ref="sale.model_sale_order"/>
             <field name="binding_type">report</field>
         </record>
-        
+
         <!-- Add Print Proforma Button to Sale Order Form -->
         <record id="view_order_form_proforma_button" model="ir.ui.view">
             <field name="name">sale.order.form.proforma.button</field>
@@ -234,8 +231,8 @@
             <field name="inherit_id" ref="sale.view_order_form"/>
             <field name="arch" type="xml">
                 <xpath expr="//button[@name='action_preview_sale_order']" position="after">
-                    <button name="%(action_report_proforma_invoice)d" 
-                            type="action" 
+                    <button name="%(action_report_proforma_invoice)d"
+                            type="action"
                             string="Print Proforma"
                             class="btn-secondary"
                             context="{'proforma': True}"/>

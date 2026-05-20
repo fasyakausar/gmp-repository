@@ -739,38 +739,20 @@ class PosSession(models.Model):
             )
             _logger.info(f"📊 Raw partners loaded: {len(partners)} (company={current_company_id})")
 
-            # ── Dedup: company-specific > global ─────────────────────────────
-            company_specific = {}
-            global_only = {}
+            # ── Dedup HANYA berdasarkan id (bukan name) ─────────────────────
+            # Nama boleh kembar antar customer yang berbeda (id, kontak, dsb
+            # berbeda), jadi tidak boleh dipakai sebagai key dedup — ini yang
+            # sebelumnya menyebabkan customer dengan nama sama hanya ter-load 1.
+            seen_ids = set()
+            final_partners = []
             for p in partners:
-                cid = p.get('company_id')
-                if isinstance(cid, (list, tuple)):
-                    cid = cid[0]
-                name_key = (p.get('name') or '').strip().lower()
-                if cid == current_company_id:
-                    company_specific[name_key] = p
-                else:
-                    if name_key not in global_only:
-                        global_only[name_key] = p
-
-            final_partners = list(company_specific.values())
-            skipped = 0
-            for name_key, p in global_only.items():
-                if name_key not in company_specific:
-                    final_partners.append(p)
-                else:
-                    skipped += 1
-                    _logger.info(
-                        f"[dedup] Skip global '{p.get('name')}' (id={p['id']}) "
-                        f"— sudah ada versi company-specific"
-                    )
+                if p['id'] in seen_ids:
+                    continue
+                seen_ids.add(p['id'])
+                final_partners.append(p)
 
             final_partners.sort(key=lambda x: (x.get('name') or '').lower())
-            _logger.info(
-                f"✅ After dedup: {len(final_partners)} partners "
-                f"(company_specific={len(company_specific)}, "
-                f"global_added={len(global_only) - skipped}, global_skipped={skipped})"
-            )
+            _logger.info(f"✅ After dedup (by id): {len(final_partners)} partners")
 
             # ── Force-load default customer ───────────────────────────────────
             if self.config_id.default_partner_id:

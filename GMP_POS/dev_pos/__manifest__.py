@@ -79,6 +79,7 @@
         # 'views/report_faktur_pajak_a5_action.xml',
         # 'views/report_faktur_pajak_template.xml',
         'views/transfer_stock_report.xml',
+        'views/rounding_quotation.xml',
         # 'reports/sales_report_menu_view.xml',
         # 'reports/report_layout_templates.xml',
         # 'reports/sales_report_pdf.xml',

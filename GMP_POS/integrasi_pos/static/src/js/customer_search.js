@@ -55,31 +55,18 @@ patch(PartnerListScreen.prototype, {
             return;
         }
 
-        // ── Dedup: prioritaskan company-specific atas global ──
-        const byName = new Map();
+        // ── Dedup HANYA berdasarkan id (bukan name) ──
+        // Nama boleh kembar antar customer berbeda (id, alamat, dsb berbeda),
+        // jadi tidak boleh dipakai sebagai key dedup — ini yang sebelumnya
+        // menyebabkan customer dengan nama sama hanya tampil 1.
         const byId = new Map();
-
         for (const partner of result) {
-            const cid = Array.isArray(partner.company_id)
-                ? partner.company_id[0]
-                : partner.company_id;
-            const nameKey = (partner.name || '').trim().toLowerCase();
-            const isCompanySpecific = cid && cid === currentCompanyId;
-
-            // Dedup by id
-            if (byId.has(partner.id)) continue;
-            byId.set(partner.id, partner);
-
-            // Dedup by name: simpan company-specific, skip global jika nama sudah ada
-            if (isCompanySpecific) {
-                byName.set(nameKey, partner);
-            } else if (!byName.has(nameKey)) {
-                byName.set(nameKey, partner);
+            if (!byId.has(partner.id)) {
+                byId.set(partner.id, partner);
             }
         }
 
-        // Hasil akhir = semua partner yang menang di byName
-        const deduped = Array.from(byName.values());
+        const deduped = Array.from(byId.values());
 
         // Add ke db jika belum ada
         for (const partner of deduped) {
